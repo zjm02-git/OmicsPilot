@@ -222,13 +222,33 @@ def load_qc_node(state: dict, runtime: Runtime) -> dict:
         return {"qc_passed": False, "qc_report": f"需要恰好 2 组，实际 {len(groups)} 组"}
     group_a, group_b = groups[0], groups[1]
 
-    # 4. 每组样本数不能太少（t 检验至少要有几个样本才有意义）
+    # 4. 样本对齐：差异分析要靠 sample_id 把分组表接到表达矩阵的列上。
+    #    这一列缺了、或者样本名对不上，必须在质检阶段就拦下 —— 否则会一路走到
+    #    人工确认之后才在 diff_analysis 里炸，用户看到的是"会话可能已失效"这种
+    #    与真实原因无关的报错，排查成本极高。
+    if "sample_id" not in metadata_df.columns:
+        return {
+            "qc_passed": False,
+            "qc_report": "分组表缺少 sample_id 列（它负责把样本与表达矩阵的列对齐）",
+        }
+    expr_samples = {str(c) for c in expr_df.columns[1:]}
+    missing = [str(s) for s in metadata_df["sample_id"] if str(s) not in expr_samples]
+    if missing:
+        return {
+            "qc_passed": False,
+            "qc_report": (
+                f"分组表有 {len(missing)} 个样本在表达矩阵里找不到（例如 {', '.join(missing[:3])}），"
+                "请确认两张表用的是同一套样本名"
+            ),
+        }
+
+    # 5. 每组样本数不能太少（t 检验至少要有几个样本才有意义）
     n_a = int((metadata_df[group_col] == group_a).sum())
     n_b = int((metadata_df[group_col] == group_b).sum())
     if n_a < 20 or n_b < 20:
         return {"qc_passed": False, "qc_report": f"每组至少 20 个样本，实际 A={n_a} / B={n_b}"}
 
-    # 5. 缺失值不能太多
+    # 6. 缺失值不能太多
     na_ratio = float(expr_df.isna().mean().mean())
     if na_ratio > 0.1:
         return {"qc_passed": False, "qc_report": f"缺失值过多：{na_ratio:.1%}"}
@@ -238,7 +258,7 @@ def load_qc_node(state: dict, runtime: Runtime) -> dict:
         f"A 组({group_a}) {n_a} 样本，B 组({group_b}) {n_b} 样本，缺失值 {na_ratio:.1%}"
     )
 
-    # 6. 读长期记忆：这个研究者上次做过分析，就复用他上次的阈值偏好
+    # 7. 读长期记忆：这个研究者上次做过分析，就复用他上次的阈值偏好
     user_id = state.get("user_id", "default")
     fc_threshold, fdr_threshold = 1.0, 0.05
     prefs_from_memory = False
