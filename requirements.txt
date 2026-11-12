@@ -1,10 +1,19 @@
+fastapi
+uvicorn
+pydantic
+sqlalchemy
+pymysql
+redis
+PyJWT
+bcrypt
+streamlit
+requests
 langgraph
+langgraph-checkpoint-postgres
 langchain-core
 langchain-deepseek
 python-dotenv
 pandas
 numpy
-# scipy 是可选依赖：装上用精确的 t 检验；不装也能跑（自动退化为正态近似）
 scipy
-# psycopg 是可选依赖：启用 USE_POSTGRES=true 时，PostgresSaver/PostgresStore 需要
 psycopg[binary]

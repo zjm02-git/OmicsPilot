@@ -29,19 +29,20 @@ def _p_values(mat_a: np.ndarray, mat_b: np.ndarray) -> np.ndarray:
     mat_a、mat_b 是 (n_genes, n_samples) 矩阵。优先用 scipy 的 Welch t 检验
     （向量化）；没装 scipy 时退化为正态近似（z 检验）。
     """
-    n_a = mat_a.shape[1]
+    n_a = mat_a.shape[1]# A 组样本数（113）
     n_b = mat_b.shape[1]
-    var_a = mat_a.var(axis=1, ddof=1)
+    var_a = mat_a.var(axis=1, ddof=1)# A 组每个基因的方差
     var_b = mat_b.var(axis=1, ddof=1)
     se2 = var_a / n_a + var_b / n_b  # 标准误的平方
-    mean_a = mat_a.mean(axis=1)
+    mean_a = mat_a.mean(axis=1)# A 组每个基因的均值
     mean_b = mat_b.mean(axis=1)
 
     if _HAS_SCIPY:
         # Welch t 检验（向量化）：t 统计量 + Welch–Satterthwaite 自由度 + t 分布
         with np.errstate(divide="ignore", invalid="ignore"):
-            t_stat = (mean_b - mean_a) / np.sqrt(se2)
-            df = se2 ** 2 / ((var_a / n_a) ** 2 / (n_a - 1) + (var_b / n_b) ** 2 / (n_b - 1))
+            t_stat = (mean_b - mean_a) / np.sqrt(se2)# t 统计量
+            # Welch–Satterthwaite 自由度：考虑方差不等
+            df = se2 ** 2 / ((var_a / n_a) ** 2 / (n_a - 1) + (var_b / n_b) ** 2 / (n_b - 1))# 自由度
             p = 2.0 * _stats.t.sf(np.abs(t_stat), df)
         # 两组方差都为 0（se2==0）时无法判断：均值相同 → 不显著，不同 → 显著
         return np.where(se2 == 0, np.where(mean_b == mean_a, 1.0, 0.0), p)
@@ -90,17 +91,18 @@ def differential_expression(
 
     # 3. 向量化算所有基因：先取两组样本的 numpy 矩阵，再一次性算均值/log2FC/p 值。
     #    （逐基因 for 循环 + .loc 取值，真实数据 2 万基因要跑 2 分多钟）
+    # 3. 向量化：一次取出两组矩阵，一次性算所有基因
     genes = list(expr.index)
-    mat_a = expr[samples_a].to_numpy(dtype=float)  # (n_genes, n_a)
-    mat_b = expr[samples_b].to_numpy(dtype=float)  # (n_genes, n_b)
+    mat_a = expr[samples_a].to_numpy(dtype=float)  # (19938, 113)
+    mat_b = expr[samples_b].to_numpy(dtype=float)  # (19938, 113)
 
-    mean_a = mat_a.mean(axis=1)
+    mean_a = mat_a.mean(axis=1) # 每个基因在 A 组的平均表达
     mean_b = mat_b.mean(axis=1)
 
     # log2 fold change（+1e-6 防 log0）
-    log2fc = np.log2((mean_b + 1e-6) / (mean_a + 1e-6))
+    log2fc = np.log2((mean_b + 1e-6) / (mean_a + 1e-6))# 倍数变化取 log2
 
-    p_values = _p_values(mat_a, mat_b)
+    p_values = _p_values(mat_a, mat_b) # 每个基因的 p 值（下一步细讲）
 
     rows = [
         {

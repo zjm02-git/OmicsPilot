@@ -11,6 +11,12 @@ class AnalysisState(TypedDict, total=False):
     # ── 输入 ──
     user_request: str     # 用户说了什么（比如"帮我找差异表达基因"）
     dataset_path: str     # 数据文件所在的目录
+
+    expr_file:str         #表达矩阵文件路径（discover_dataset 识别出来的）
+    meta_file:str         #分组表文件路径
+    go_file:str           #GO 注释文件路径（可能为 None）
+    group_col:str         #分组列名（识别出来的，不再写死 "condition"）
+
     user_id: str          # 用户标识（长期记忆按它区分不同研究者）
 
     # ── ① 需求解析的结果 ──
@@ -33,9 +39,17 @@ class AnalysisState(TypedDict, total=False):
     sig_genes_up: list    # 上调显著基因名列表
     sig_genes_down: list  # 下调显著基因名列表
 
-    # ── ④ 富集分析的结果 ──
+    # ── ④ 无监督分析的结果 ──
+    pca_summary: str    # PCA 分析摘要（主成分解释比例等)
+    cluster_summary:str # 聚类分析摘要
+
+
+    # ── ⑤ 富集分析的结果 ──
     enrichment_summary: str  # 富集分析摘要（哪些通路被显著富集）
 
-    # ── ⑤⑥ 解读与报告 ──
+    # ── ⑥ 解读与报告 ──
     interpretation: str   # LLM 的解读
     final_report: str     # 最终报告
+
+    # ── ⑦ 知识库问答（RAG 语义检索）──
+    qa_answer: str  # 问答节点的答案（检索证据 + LLM 生成）

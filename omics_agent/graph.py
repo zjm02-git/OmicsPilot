@@ -3,6 +3,8 @@
 图的结构：
   START → parse_intent
               ├─ analysis_type=other → report（暂不支持）
+              ├─ analysis_type=pca → pca_analysis → report → END
+              ├─ analysis_type=clustering → cluster_analysis → report → END
               └─ analysis_type=differential → load_qc
                         ├─ 质检不合格 → report（质检失败）
                         └─ 质检合格 → human_review（人工确认）
@@ -20,8 +22,17 @@ from omics_agent.state import AnalysisState
 
 
 def route_after_intent(state: dict) -> str:
-    """① 之后的分叉：只支持差异分析，其他直接出报告。"""
-    return "load_qc" if state.get("analysis_type") == "differential" else "report"
+    """① 之后的分叉：按分析类型路由到不同节点。"""
+    analysis_type=state.get("analysis_type")
+    if analysis_type == "differential":
+        return "load_qc"
+    if analysis_type == "pca":
+        return "pca_analysis"
+    if analysis_type == "clustering":
+        return "cluster_analysis"
+    if analysis_type == "qa":  # ← 新加：知识库问答
+        return "qa_node"
+    return "report"  # other 或未知 → 不支持
 
 
 def route_after_qc(state: dict) -> str:
@@ -37,7 +48,13 @@ def route_after_review(state: dict) -> str:
 def build_graph():
     builder = StateGraph(AnalysisState)
 
-    # 加节点
+    # 加节点pca等
+    builder.add_node("pca_analysis", nodes.pca_analysis_node)
+    builder.add_node("cluster_analysis", nodes.cluster_analysis_node)
+
+    #Rag
+    builder.add_node("qa_node", nodes.qa_node)  # ← 新加
+
     builder.add_node("parse_intent", nodes.parse_intent_node)
     builder.add_node("load_qc", nodes.load_qc_node)
     builder.add_node("human_review", nodes.human_review_node)
@@ -54,7 +71,12 @@ def build_graph():
     # add_conditional_edges 三参数：源节点 / 路由函数（返回字符串）/ 路由返回值→目标节点的映射
     builder.add_conditional_edges(
         "parse_intent", route_after_intent,
-        {"load_qc": "load_qc", "report": "report"},
+        {"load_qc": "load_qc",
+         "pca_analysis": "pca_analysis",
+         "cluster_analysis": "cluster_analysis",
+         "qa_node": "qa_node",
+         "report": "report",
+         },
     )
 
     # 条件边 2：质检合格 → 人工确认，否则 → 报告
@@ -68,6 +90,11 @@ def build_graph():
         "human_review", route_after_review,
         {"diff_analysis": "diff_analysis", "report": "report"},
     )
+
+    builder.add_edge("pca_analysis", "report")
+    builder.add_edge("cluster_analysis", "report")
+
+    builder.add_edge("qa_node", "report")  # ← 新加：问答完直接出报告
 
     builder.add_edge("diff_analysis", "enrichment")
     builder.add_edge("enrichment", "interpret")

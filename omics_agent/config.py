@@ -41,10 +41,13 @@ def get_db_url() -> str:
 def get_checkpointer():
     """检查点存储器（短期记忆）。默认内存；启用 PG 时用 PostgresSaver，重启不丢。"""
     if use_postgres():
-        import psycopg
+        from psycopg_pool import ConnectionPool
+        from psycopg.rows import dict_row
         from langgraph.checkpoint.postgres import PostgresSaver
-        conn = psycopg.connect(get_db_url())
-        checkpointer = PostgresSaver(conn)
+        # autocommit=True：setup 的迁移里有 CREATE INDEX CONCURRENTLY，不能在事务里跑
+        # row_factory=dict_row：查询结果按列名返回字典，PostgresSaver 靠它解析结果
+        pool = ConnectionPool(get_db_url(), kwargs={"autocommit": True, "row_factory": dict_row})
+        checkpointer = PostgresSaver(pool)    # 传连接池，拿到真正的 PostgresSaver 实例
         checkpointer.setup()  # 幂等：自动建表
         return checkpointer
     return InMemorySaver()
@@ -53,10 +56,12 @@ def get_checkpointer():
 def get_store():
     """长期记忆存储器。默认内存；启用 PG 时用 PostgresStore，重启不丢。"""
     if use_postgres():
-        import psycopg
+        from psycopg_pool import ConnectionPool
+        from psycopg.rows import dict_row
         from langgraph.store.postgres import PostgresStore
-        conn = psycopg.connect(get_db_url())
-        store = PostgresStore(conn)
+        # autocommit=True + row_factory=dict_row 的理由同 get_checkpointer
+        pool = ConnectionPool(get_db_url(), kwargs={"autocommit": True, "row_factory": dict_row})
+        store = PostgresStore(pool)           # 传连接池，拿到真正的 PostgresStore 实例
         store.setup()  # 幂等：自动建表
         return store
     return InMemoryStore()

@@ -1,0 +1,74 @@
+name: omicspilot   # 项目名：compose 用它给容器/网络/卷加前缀。目录名是中文会被过滤成空，必须显式写英文名
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: omics
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck: # ← 新增：定期探活，确认 mysql 能接客了
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-p123456" ]  # mysqladmin ping 通了 = ready
+      interval: 5s                                 #   每 5 秒探一次
+      timeout: 5s                                  #   单次最多等 5 秒，超时算这次失败
+      retries: 20                                  #   最多重试 20 次（5s×20≈100 秒内必须 ready，否则标 unhealthy）
+
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+
+  # ── PostgreSQL：给 LangGraph 存「检查点 + 长期记忆」──
+  # 为什么单独起：LangGraph 的 checkpointer 官方只支持 Postgres，不支持 MySQL，
+  # 所以业务数据放 MySQL，框架状态放这个 Postgres，分工明确。
+  postgres:
+    image: postgres:16                        # 官方 postgres 镜像（16 版，稳定）
+    environment:                              # 容器第一次启动时，按这三个值自动建「用户 + 库」
+      POSTGRES_USER: langgraph_user           #   用户名（必须和 config.py 的 DEFAULT_DB_URL 对上）
+      POSTGRES_PASSWORD: "123456"             #   密码（同上）
+      POSTGRES_DB: langgraph_db               #   库名（同上）
+    ports:
+      - "5432:5432"                           # 容器 5432（postgres 默认端口）映射到本机 5432
+    volumes:
+      - pg_data:/var/lib/postgresql/data      # 数据落进命名卷：容器删了/重启，数据都还在
+    healthcheck: # ← 新增：pg_isready 是 postgres 自带的探活命令
+      test: [ "CMD-SHELL", "pg_isready -U langgraph_user -d langgraph_db" ]  # 返回 0 = 能接受连接
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  backend:
+    build: .
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis      # Redis 的服务名（容器间互相访问用服务名，不是 IP）
+      MYSQL_URL: mysql+pymysql://root:123456@mysql:3306/omics  # 业务库：MySQL
+      DATABASE_URL: postgresql://langgraph_user:123456@postgres:5432/langgraph_db?sslmode=disable
+      # ← 新增：框架状态库（主机名是 postgres，不是 localhost）
+      USE_POSTGRES: "true"
+    # ← 新增：打开开关，checkpointer 才切 Postgres；不设就退回内存版
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy     # 等 mysql 的 healthcheck 通过（真 ready）才启动 backend
+      postgres:
+        condition: service_healthy     # 等 postgres 真 ready 才启动
+      redis:
+        condition: service_started     # redis 秒启动、无初始化，只要容器起来就行，不用探活
+
+  frontend:
+    build: ./frontend
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+
+volumes:
+  mysql_data:
+  pg_data:             # ← 新增：给 postgres 用的命名卷

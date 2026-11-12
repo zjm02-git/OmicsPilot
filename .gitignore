@@ -7,8 +7,10 @@ __pycache__/
 .venv/
 venv/
 
-# 生成的数据（重新跑 generate_data.py 即可再生）
+# 生成的数据（重新跑脚本即可再生）
 data/*.csv
+data/*.npy
+chroma_db/
 
 # IDE
 .idea/
@@ -16,3 +18,9 @@ data/*.csv
 
 # Obsidian 笔记配置
 docs/.obsidian/
+
+# 临时/杂项文件
+*.base
+.gitignore.txt
+.dockerignore.txt
+Dokerfile.txt
