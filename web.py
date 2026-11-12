@@ -1,262 +1,588 @@
-'''fastapi后端'''
-# http://localhost:8501
-#http://localhost:8000/docs
+"""FastAPI 后端：鉴权 / 上传 / 分析（同步 + 异步）/ 缓存 / 健康检查 / 指标。
 
-# ============ 第 1 块：导入库 + 创建应用 ============
-#一次上传多次文件
-from fastapi import FastAPI,Depends,Header,HTTPException,UploadFile,File
-from typing import List
+本轮加固（每条都对应一个真实故障）：
+  1. 缓存 key 带上数据集指纹 —— 修掉"换一份数据、问同一句话，却拿到上一份报告"的正确性 bug；
+  2. Redis 主存 + 进程内兜底 + TTL 抖动 + single-flight —— Redis 挂掉服务仍可用；
+     同一句话并发进来只跑一次图（一次图实测 ~25s，重复计算就是白烧线程与 token）；
+  3. 长任务异步化（/analyze_async + /jobs/{id}）—— 25s 的图执行不再占着 HTTP 连接；
+  4. /healthz + /metrics + X-Request-ID —— 出问题能回答"哪个依赖挂了、哪条请求、慢在哪一步"；
+  5. 上传与 dataset_path 加固 —— 扩展名白名单、大小上限、路径必须落在 data/ 内
+     （原来 dataset_path 完全由客户端给，可以指到任意目录）。
 
-from pydantic import BaseModel
-#FastAPI 的「安全工具箱」，鉴权相关的工具都从这拿。
-#HTTPBearer —— 一个「自动验票闸机」类。它专门去 HTTP 请求头里找 Authorization: Bearer xxx
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-#HTTPAuthorizationCredentials —— 一个「数据盒子」类，
-# 用来装闸机检查完的结果。盒子里有个字段 .credentials，装的就是纯 token。
+接口契约保持不变（frontend/app.py 依赖）：
+  /register /login /me /user /change_password
+  /upload → {dataset_path}
+  /analyze → {status: pending_confirm|done, thread_id, qc_report, group_a, group_b, report}
+  /confirm → {report}
+  /history → 列表
+"""
 
-from langgraph.types import Command
-from omics_agent.graph import build_graph
-
-import uuid    #专门造「全世界唯一」的编号
+# ============ 第 0 块：先把 .env 读进来 ============
+# 必须在任何 os.getenv 之前：原版本把 load_dotenv() 放在 redis 客户端之后，
+# REDIS_HOST / REDIS_PORT / SECRET_KEY 实际都没读到，静默走了默认值。
 import os
-import time
-import jwt     # 签发 + 验证 JWT（登机牌）
-import bcrypt  # 密码哈希（存密码用）
+
 from dotenv import load_dotenv
 
-#redis缓存库
-import redis
-import hashlib#算哈希
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# 连接 Redis（全局一条连接，反复用）127.0.0.1 = 本机  + 端口+让取回来的值自动转成字符串
-redis_client=redis.Redis(host=os.getenv("REDIS_HOST","127.0.0.1"),port=int(os.getenv("REDIS_PORT","6379")),decode_responses=True)
+# ============ 第 1 块：导入库 + 创建应用 ============
+import shutil
+import time
+import uuid
+from typing import List
 
-#存用户表到数据库 ====1.查用户 ===2.插入新用户
-from db import get_user_by_username,create_user,delete_user,update_password,save_history,update_history_report,get_history_by_user
+import bcrypt
+import jwt
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from langgraph.types import Command
+from pydantic import BaseModel
 
+from db import (
+    create_user,
+    delete_user,
+    get_history_by_user,
+    get_user_by_username,
+    save_history,
+    update_history_report,
+    update_password,
+)
+from omics_agent import jobs as jobs_mod
+from omics_agent import metrics
+from omics_agent.cache import ReportCache, build_key
+from omics_agent.graph import build_graph
 
-load_dotenv()
-app=FastAPI()
-  # 标准验牌方案：Swagger 会因此出现 Authorize 按钮；auto_error=False 让我们自己提示中文
-graph=build_graph()#graph 放在外面（全局)服务是「常驻」的，造图成本高，造一次反复用
+app = FastAPI(title="多组学数据分析智能体", version="2.0")
 
+# 造图成本高（编译 + 连 checkpointer），服务常驻，造一次反复用
+graph = build_graph()
 
-
-security = HTTPBearer(auto_error=False)#造闸机。auto_error=False —— 一个开关。默认闸机发现问题会自己抛 403（英文提示 Not authenticated）；
-# 设成 False 就是「发现问题别自动报错，把结果交给我」，这样我们才能保留中文的「没带登记牌」
+# 缓存与任务注册表：进程内单例
+CACHE = ReportCache()
+JOBS = jobs_mod.JobRegistry(max_workers=int(os.getenv("JOB_WORKERS", "4")))
+redis_client = CACHE.redis  # 兼容旧代码里对 redis_client 的引用
 
 # ============ 第 2 块：JWT 配置常量 ============
-SECRET_KEY = os.getenv("SECRET_KEY")# 签名用的私章，从 .env 读，别写死在代码里
-ALGORITHM="HS256"                    # 签名算法（对称：一把钥匙既能签又能验）
-ACCESS_TOKEN_EXPIRE_MINUTES=60*60# 登机牌有效期 1 小时
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    # 没配密钥时不要静默用 None（jwt.encode 会 TypeError）；
+    # 退化成进程级随机密钥并明确告警：重启后旧 token 失效，但不至于服务起不来。
+    SECRET_KEY = uuid.uuid4().hex
+    print("[warn] 未配置 SECRET_KEY，已生成进程级临时密钥；重启后 token 将失效")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 60
+
+# 数据集根目录：dataset_path 必须落在它下面（防路径穿越）
+ALLOWED_DATA_ROOT = os.path.abspath(os.path.join(BASE_DIR, "data"))
+
+# 上传约束
+UPLOAD_MAX_BYTES = int(os.getenv("UPLOAD_MAX_MB", "200")) * 1024 * 1024
+UPLOAD_MAX_FILES = int(os.getenv("UPLOAD_MAX_FILES", "20"))
+ALLOWED_SUFFIXES = (".csv", ".tsv", ".txt")
+
+# single-flight 里"等别人算完"的最长等待（秒）：超时宁可自己再算一遍，也不把请求挂死
+CACHE_WAIT_S = float(os.getenv("CACHE_WAIT_S", "180"))
+# 人工确认后最多续跑几轮：防止 resume 立刻又 interrupt 造成死循环
+MAX_RESUME_ROUNDS = int(os.getenv("MAX_RESUME_ROUNDS", "5"))
 
 
 # ============ 第 3 块：密码哈希（bcrypt）============
-def hash_password(password:str)->str:
-    # hashpw(密码字节, 盐)：拿「密码 + 随机盐」算出哈希
-    #盐 = 随机字符，作用：同一个密码每次哈希结果都不同，防止攻击者拿现成的「密码→哈希」对照表（彩虹表）撞库
-    return bcrypt.hashpw(password.encode("utf-8"),bcrypt.gensalt()).decode("utf-8")
-
-def verify_password(password:str,hashed:str)->bool:
-    # 用「哈希里自带的那份盐」把用户输入的密码再算一遍，和原哈希比对，一致返回 True
-    return bcrypt.checkpw(password.encode("utf-8"),hashed.encode("utf-8"))
+def hash_password(password: str) -> str:
+    # 盐 = 随机字符：同一密码每次哈希都不同，防彩虹表撞库
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
-# ============ 第 4 块：签发 token（发登机牌）============
-def create_token(user_id:int,username:str)->str:
-    payload={
-        "sub":str(user_id), # sub = subject，JWT 标准字段，放「是谁」
-        "username":username,
-        "exp":int(time.time()+ACCESS_TOKEN_EXPIRE_MINUTES)## 过期时间戳
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+
+
+# ============ 第 4 块：签发 token ============
+def create_token(user_id: int, username: str) -> str:
+    payload = {
+        "sub": str(user_id),  # sub = subject，JWT 标准字段
+        "username": username,
+        "exp": int(time.time() + ACCESS_TOKEN_EXPIRE_MINUTES),
     }
-    return jwt.encode(payload,SECRET_KEY ,algorithm=ALGORITHM)# 盖章成 token
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+# ============ 第 5 块：可观测（请求 ID + 按路由耗时 + 状态码）============
+@app.middleware("http")
+async def observability(request, call_next):
+    """给每条请求打 X-Request-ID，并记录按"路由模板"聚合的耗时与状态码。"""
+    rid = request.headers.get("x-request-id") or metrics.new_request_id()
+    request.state.request_id = rid  # 异常处理器要用：contextvar 在中间件退出时已被重置
+    token = metrics.set_request_id(rid)
+    start = time.perf_counter()
+    status_code = 500
+    response = None
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+    except Exception:  # noqa: BLE001 - 先记账再抛，否则 500 的耗时统计会丢
+        metrics.incr("http_unhandled_error_total")
+        raise
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        # 用路由模板（/jobs/{job_id}）而不是原始路径，否则每个 id 都会变成一条独立指标
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or "unmatched"
+        metrics.observe_ms(f"http.{request.method}.{path}", elapsed_ms)
+        metrics.incr(f"http_status_{status_code}_total")
+        metrics.reset_request_id(token)
+
+    response.headers["X-Request-ID"] = rid
+    response.headers["X-Elapsed-Ms"] = f"{elapsed_ms:.0f}"
+    return response
 
 
-# ============ 第 5 块：注册账号接口============
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    """兜底：漏网的异常也要回一段可定位的 JSON，而不是光秃秃的 Internal Server Error。
+
+    响应里带 request_id，用户报错时报这一串就能在日志里定位到同一条请求。
+    """
+    metrics.incr("unhandled_exception_total")
+    rid = getattr(request.state, "request_id", None) or metrics.get_request_id()
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "服务内部错误，请稍后重试",
+            "error_type": type(exc).__name__,
+            "request_id": rid,
+        },
+        headers={"X-Request-ID": rid or ""},
+    )
+
+
+# ============ 第 6 块：注册 / 登录 / 验签 ============
+security = HTTPBearer(auto_error=False)
+
+
 class RegisterRequest(BaseModel):
-    username:str
-    password:str
+    username: str
+    password: str
+
 
 @app.post("/register")
-def register(req:RegisterRequest):
-    if get_user_by_username(req.username):        # 先查有没有同名
-        raise HTTPException(status_code=400,detail="用户名已存在")
-    hashed=hash_password(req.password)
-    create_user(username=req.username,hashed_password=hashed)# 密码算哈希
-    return{"message":"注册成功"}            # 存进库
+def register(req: RegisterRequest):
+    if get_user_by_username(req.username):  # 先查有没有同名
+        raise HTTPException(status_code=400, detail="用户名已存在")
+    hashed = hash_password(req.password)
+    create_user(username=req.username, hashed_password=hashed)
+    return {"message": "注册成功"}
 
 
-# ============ 第 6 块：登录接口 === 查库===（发 token 的窗口）============
 class LoginRequest(BaseModel):
-    username:str
-    password:str
+    username: str
+    password: str
+
 
 @app.post("/login")
-def login(req:LoginRequest):
-    # ① 查用户存不存在
-    user=get_user_by_username(req.username) # 查库
-    # ② 用户不存在 或 密码不对 → 统一回「用户名或密码错误」
-    #    故意不区分是哪个错，防止别人一个个试出「哪些用户名存在」
-    #"把你输入的密码再按一次指纹，跟库里存的指纹对一下
-    if user is None or not verify_password(req.password,user.hashed_password):#输入的密码, 库里的指纹
-        raise HTTPException(status_code=401,detail="用户名或密码错误")
-    # ③ 都对了 → 现场签一张登机牌发出去
-    token=create_token(user.id,user.username)
-    return {"access_token":token,"token_type":"Bearer"}
-    #前端既需要牌（access_token），也需要知道怎么用它（token_type 决定放哪、加什么前缀）
+def login(req: LoginRequest):
+    user = get_user_by_username(req.username)
+    # 用户不存在 / 密码不对统一回同一句，避免被枚举出"哪些用户名存在"
+    if user is None or not verify_password(req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    return {"access_token": create_token(user.id, user.username), "token_type": "Bearer"}
 
 
-# ============ 第 7 块：验签（安检验牌）============
-# ① 依赖函数：就是"门口的验票员"，负责检查 token，通过则返回身份
-#authorization从 HTTP 请求头（Header）里取，翻到了用翻到的值，翻不到才给 None
 def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)):
-    # HTTPBearer 已经帮你检查了"有没有带 Bearer 前缀"，并摘掉前缀
-    # 所以 credentials 是 None 就代表"没带牌或格式不对"
-    if credentials is None:# 闸机说"没带牌"（因为 auto_error=False，它不报错，只给 None）
+    if credentials is None:
         raise HTTPException(status_code=401, detail="没带登记牌")
-
-    # credentials.credentials 就是摘掉 "Bearer " 后的纯 token，直接拿去验
     token = credentials.credentials
-    try:#下面这行可能抛异常，包起来准备接。
-        #验签通过 → 返回解出来的 payload 字典（就是我们 encode 时塞进去的那些）
-        payload=jwt.decode(token,SECRET_KEY,algorithms=[ALGORITHM])
-    except jwt.ExpiredSignatureError:# 过期（它是 InvalidTokenError 的子类，要先捕获）
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.ExpiredSignatureError:  # 是 InvalidTokenError 的子类，要先捕获
         raise HTTPException(status_code=401, detail="登机牌过期了")
-    except jwt.InvalidTokenError: # 被篡改 / 格式错
+    except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="登机牌是假的或被动过")
-    # 验票通过，返回「身份牌」
-    return {"user_id":int(payload["sub"]),"username":payload["username"]} # 验票通过，给"身份牌"
+    return {"user_id": int(payload["sub"]), "username": payload["username"]}
 
-# # ② /me：验票的试金石，返回「我是谁」
+
 @app.get("/me")
-def read_me(user:dict=Depends(get_current_user)):
-    return user# 这里拿到的 user 已经是"验过票"的身份，不用再自己校验
+def read_me(user: dict = Depends(get_current_user)):
+    return user
 
 
-# ============ 第 8 块：删除账号接口============
-@app.delete("/user")#
-def delete_account(user:dict=Depends(get_current_user)):
-#删除要「先验票」——只有登录的人才能删自己，没登录的人碰不到这个接口
+# ============ 第 7 块：账号管理 ============
+@app.delete("/user")
+def delete_account(user: dict = Depends(get_current_user)):
     delete_user(user["username"])
-    return {"message":"账号已删除"}
+    return {"message": "账号已删除"}
 
 
-# ============ 第 9  块：改变账号密码接口============
 class ChangePasswordRequest(BaseModel):
-    old_password:str
-    new_password:str
+    old_password: str
+    new_password: str
+
 
 @app.post("/change_password")
-def change_password(req:ChangePasswordRequest,user:dict=Depends(get_current_user)):
-     # 先查库拿完整用户（验旧密码要用 hashed_password）
-     do_user=get_user_by_username(user["username"])
-     if not verify_password(req.old_password,do_user.hashed_password):# 验旧密码
-         raise HTTPException(status_code=401,detail="旧密码不对")
-     update_password(user["username"],hash_password(req.new_password))# 改密码落库
-     return  {"message":"密码修改成功"}
+def change_password(req: ChangePasswordRequest, user: dict = Depends(get_current_user)):
+    do_user = get_user_by_username(user["username"])
+    if do_user is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if not verify_password(req.old_password, do_user.hashed_password):
+        raise HTTPException(status_code=401, detail="旧密码不对")
+    update_password(user["username"], hash_password(req.new_password))
+    return {"message": "密码修改成功"}
 
-# ============ 第 10 块：业务接口（/analyze + /confirm）============
-#上传多个文件
+
+# ============ 第 8 块：上传（白名单 + 大小上限 + 文件名净化）============
+def _safe_filename(raw: str | None) -> str:
+    """只留文件名本身：去掉目录成分，挡掉 ../../ 这类路径穿越。"""
+    name = os.path.basename((raw or "").replace("\\", "/")).strip()
+    if not name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="文件名非法")
+    if not name.lower().endswith(ALLOWED_SUFFIXES):
+        raise HTTPException(
+            status_code=400,
+            detail=f"只接受 {'/'.join(ALLOWED_SUFFIXES)} 文件，收到：{name}",
+        )
+    return name
+
+
 @app.post("/upload")
-# List[UploadFile] 类型标注：一个列表，里面每个都是UploadFile（上传文件）
-def upload_files(files:List[UploadFile]=File(),user:dict=Depends(get_current_user)):
-    #存"这次任务的目录路径"
-    task_dir=os.path.join("data","upload",str(uuid.uuid4()))
-    #数据根目录 + 上传文件放这 +每次来都发一个不重复的门牌号
+def upload_files(files: List[UploadFile] = File(), user: dict = Depends(get_current_user)):
+    if not files:
+        raise HTTPException(status_code=400, detail="没有收到文件")
+    if len(files) > UPLOAD_MAX_FILES:
+        raise HTTPException(status_code=400, detail=f"一次最多上传 {UPLOAD_MAX_FILES} 个文件")
 
-    os.makedirs(task_dir,exist_ok=True)#把这个目录建出来；已经有了就跳过
+    task_dir = os.path.join("data", "upload", str(uuid.uuid4()))
+    os.makedirs(task_dir, exist_ok=True)
 
-    for f in files:
-        #把当前文件的内容全读出来，存进 content
-        content=f.file.read()
-        #b = 二进制（binary，因为文件是字节不是文字）
-        with open(os.path.join(task_dir,f.filename),"wb") as out:
-            out.write(content)
+    try:
+        for f in files:
+            name = _safe_filename(f.filename)
+            declared = getattr(f, "size", None)  # 已知大小就先拒，别把超大文件落盘再报错
+            if declared is not None and declared > UPLOAD_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{name} 超过上限 {UPLOAD_MAX_BYTES // (1024 * 1024)}MB",
+                )
+            written = 0
+            target = os.path.join(task_dir, name)
+            with open(target, "wb") as out:
+                while True:  # 分块写：不把整个文件读进内存，也能中途拦住超大文件
+                    chunk = f.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > UPLOAD_MAX_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"{name} 超过上限 {UPLOAD_MAX_BYTES // (1024 * 1024)}MB",
+                        )
+                    out.write(chunk)
+            if written == 0:
+                raise HTTPException(status_code=400, detail=f"{name} 是空文件")
+    except Exception:
+        shutil.rmtree(task_dir, ignore_errors=True)  # 失败不留半成品目录占盘
+        raise
 
-    #把读到的字节写进新文件里（完成"存盘"）
-    return{"dataset_path":task_dir}
+    metrics.incr("upload_total")
+    return {"dataset_path": task_dir}
 
+
+# ============ 第 9 块：分析核心（缓存 + single-flight + 图执行）============
 class AnalizeRequest(BaseModel):
-    user_request:str
-    dataset_path:str='data'
-    user_id:str="request-01"
+    user_request: str
+    dataset_path: str = "data"
+    user_id: str = "request-01"
+    use_cache: bool = True  # 基准测试要测"纯冷路径"时置 false
+
 
 class ConfirmRequest(BaseModel):
-    thread_id:str
-    approved:bool
+    thread_id: str
+    approved: bool
 
 
-#Depends 隐形一步：先自动调 get_current_user（摘前缀 + 验签）
-#身份令牌（Authorization: Bearer <token>）
-# FastAPI从请求头抽 Authorization 喂给 get_current_user
+def _validate_dataset_path(raw: str) -> str:
+    """把客户端给的路径解析成绝对路径，并强制落在 data/ 之内。"""
+    path = os.path.abspath(raw or "data")
+    root = os.path.normcase(ALLOWED_DATA_ROOT)
+    target = os.path.normcase(path)
+    try:
+        common = os.path.commonpath([root, target])
+    except ValueError:  # 连盘符都不同（如 D: 与 C:），commonpath 直接抛
+        common = ""
+    if target != root and common != root:
+        raise HTTPException(status_code=400, detail="数据集路径必须位于 data/ 目录内")
+    if not os.path.isdir(path):
+        raise HTTPException(status_code=400, detail=f"数据集目录不存在：{raw}")
+    return path
 
-#声明中断+人工审核接口
-@app.post('/analyze')#返回分析结果给前端
-def analyze(asg:AnalizeRequest,user:list=Depends(get_current_user)):
 
-    # ① 先查缓存：这个请求之前算过吗？将用户问题MD5计算结果存成key,等下查重
-    cache_key="report:"+hashlib.md5(asg.user_request.encode("utf-8")).hexdigest()
-    cached = redis_client.get(cache_key)# 用连接对象调 get，按 key 去 Redis 里取值
-    if cached:  # 之前问过完全相同的问题+返回告前端"完成，直接显示"+缓存里的报告 +标记，"缓存命中"
-        return {"status": "done", "report": cached, "from_cache": True}
-
-    thread_id=str(uuid.uuid4())
-    config={"configurable":{"thread_id":thread_id}}
-    initial={
-        "user_request":asg.user_request,
-        "dataset_path":asg.dataset_path,
-        "user_id":asg.user_id
+def _run_graph(asg: AnalizeRequest, dataset_path: str, history_user_id: int, cache_key: str) -> dict:
+    """真正跑一次图，返回可直接回给前端的响应体。"""
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    initial = {
+        "user_request": asg.user_request,
+        "dataset_path": dataset_path,
+        "user_id": asg.user_id,  # 长期记忆按"研究者标识"分桶，允许任意字符串
     }
-    # 第一次 invoke，checkpointer 用这个编号存检查点
-    result=graph.invoke(initial,config=config)#整条流水线跑完（或暂停时）的"状态背包
+
+    jobs_mod.progress("质检 + 人工确认")
+    with metrics.timer("graph.phase1_ms"):
+        result = graph.invoke(initial, config=config)
+
     if result.get("__interrupt__"):
-        info=result["__interrupt__"][0].value
-        # 质检需人工确认：先存一条「待确认」（报告还没出）
-        save_history(user_id=user["user_id"],thread_id=thread_id,
-                     user_request=asg.user_request,status="pending")
+        info = result["__interrupt__"][0].value
+        _remember_pending(thread_id, cache_key)  # confirm 之后用它回填缓存
+        _safe_save_history(
+            user_id=history_user_id,
+            thread_id=thread_id,
+            user_request=asg.user_request,
+            status="pending",
+        )
         return {
-            "status":"pending_confirm",#（报告还没出，先记个"进行中"）
-            "thread_id":thread_id,
-            "qc_report":info.get("qc_report"),
-            "group_a":info.get("group_a"),
-            "group_b":info.get("group_b"),
-               }
-    #  ② 直接出报告（质检不合格/类型不支持）：先取报告，再存缓存
-    final_report = result.get("final_report")
+            "status": "pending_confirm",
+            "thread_id": thread_id,
+            "qc_report": info.get("qc_report"),
+            "group_a": info.get("group_a"),
+            "group_b": info.get("group_b"),
+        }
 
-    #调 set，往 Redis 里存一个 key-value
-    redis_client.set(cache_key,final_report,ex=24*3600)#"24 小时后自动删"
+    final_report = result.get("final_report") or ""
+    _safe_save_history(
+        user_id=history_user_id,
+        thread_id=thread_id,
+        user_request=asg.user_request,
+        status="done",
+        final_report=final_report,
+    )
+    body = {"status": "done", "report": final_report, "thread_id": thread_id}
+    if result.get("degraded"):
+        # 降级产出（模型不可用时只剩统计摘要）必须让调用方知道，前端才好提示"建议稍后重试"
+        body["degraded"] = True
+        body["degraded_stages"] = list(result.get("degraded_stages") or [])
+    return body
 
-    save_history(user_id=user["user_id"],thread_id=thread_id,
-                 user_request=asg.user_request,status="done",final_report=final_report)
-    return{"status":"done","report":final_report}
-    #status: "done"：告诉前端：「已经跑完，直接显示报告，不用确认」信号
+
+def _safe_save_history(**kwargs) -> None:
+    """历史写库失败不能吞掉用户的报告：算都已经算完了，报告必须能拿走。"""
+    try:
+        save_history(**kwargs)
+    except Exception:  # noqa: BLE001
+        metrics.incr("history_write_error_total")
 
 
-#声明中断结束分析生成最终报告
+def _run_and_cache(asg: AnalizeRequest, dataset_path: str, key: str, history_user_id: int) -> dict:
+    body = _run_graph(asg, dataset_path, history_user_id, key)
+    if body.get("status") == "done" and body.get("report"):
+        # 只缓存完整报告：pending 还没算完；降级报告（模型挂了只有统计摘要）写进去
+        # 会让后续 24 小时的所有同问请求都拿到这份残缺内容。
+        if body.get("degraded"):
+            metrics.incr("cache_skip_degraded_total")
+        else:
+            CACHE.set(key, body["report"])
+            metrics.incr("cache_write_total")
+    return body
+
+
+def _cached_body(report: str, source: str, key: str) -> dict:
+    return {
+        "status": "done",
+        "report": report,
+        "from_cache": True,
+        "cache_source": source,
+        "cache_key": key,
+    }
+
+
+# HITL 会把"算到一半"的请求挂起，报告在 /confirm 才生成。
+# 这里把缓存 key 暂存 2 小时，confirm 完成后回填，重复提问才能命中。
+PENDING_TTL = 2 * 3600
+
+
+def _remember_pending(thread_id: str, cache_key: str) -> None:
+    CACHE.set(f"pending:{thread_id}", cache_key, ttl=PENDING_TTL)
+
+
+def _pop_pending(thread_id: str) -> str | None:
+    key = CACHE.get(f"pending:{thread_id}")
+    if key:
+        CACHE.delete(f"pending:{thread_id}")
+    return key
+
+
+def _core_analyze(asg: AnalizeRequest, history_user_id: int) -> dict:
+    """缓存命中 → 直接返回；未命中 → 抢计算权，抢不到就等别人的结果。"""
+    dataset_path = _validate_dataset_path(asg.dataset_path)
+    key = build_key(asg.user_request, dataset_path)
+
+    if not asg.use_cache:
+        metrics.incr("cache_bypass_total")
+        return _run_graph(asg, dataset_path, history_user_id, key)
+
+    value, source = CACHE.get_source(key)
+    if value:
+        metrics.incr("cache_hit_total")
+        return _cached_body(value, source, key)
+    metrics.incr("cache_miss_total")
+
+    with CACHE.inflight(key) as leader:
+        if leader:
+            # double-check：抢到锁之前，可能刚好有人写完了
+            again, source2 = CACHE.get_source(key)
+            if again:
+                metrics.incr("cache_hit_total")
+                metrics.incr("cache_singleflight_dedup_total")
+                return _cached_body(again, source2, key)
+            return _run_and_cache(asg, dataset_path, key, history_user_id)
+
+        # 别人正在算：等他算完复用同一份结果（并发击穿合并）
+        metrics.incr("cache_singleflight_wait_total")
+        waited = CACHE.wait_for(key, timeout=CACHE_WAIT_S)
+        if waited:
+            metrics.incr("cache_hit_total")
+            return _cached_body(waited, "wait", key)
+        # 等超时（对端失败或太慢）：自己算一遍，宁可重复也不挂死服务
+        metrics.incr("cache_singleflight_fallback_total")
+        return _run_and_cache(asg, dataset_path, key, history_user_id)
+
+
+@app.post("/analyze")
+def analyze(asg: AnalizeRequest, user: dict = Depends(get_current_user)):
+    """同步分析：跑完才返回。适合前端愿意等，或已命中缓存的场景。"""
+    with metrics.timer("api.analyze_ms"):
+        body = _core_analyze(asg, user["user_id"])
+    body["request_id"] = metrics.get_request_id()
+    return body
+
+
 @app.post("/confirm")
-def confirm(req:ConfirmRequest,user:list=Depends(get_current_user)):
-    config={"configurable":{"thread_id":req.thread_id}}
-    #第二次 invoke，checkpointer 用这个编号找检查点
-    result=graph.invoke(Command(resume={"approved":req.approved}),config=config)
-    while result.get("__interrupt__"):
-        #只要还中断，就一直续跑
-        result=graph.invoke(Command(resume={"approved":req.approved}),config=config)
-    final_report=result.get("final_report")
-    # 报告出全了：按 thread_id 找到当初那条 pending，补报告 + 改 done
-    update_history_report(thread_id=req.thread_id,final_report=final_report)
-    return {"report":final_report}
+def confirm(req: ConfirmRequest, user: dict = Depends(get_current_user)):
+    """人工确认后续跑（HITL 第二段）。"""
+    config = {"configurable": {"thread_id": req.thread_id}}
+    try:
+        with metrics.timer("graph.phase2_ms"):
+            result = graph.invoke(Command(resume={"approved": req.approved}), config=config)
+            rounds = 0
+            while result.get("__interrupt__") and rounds < MAX_RESUME_ROUNDS:
+                # 还中断就继续续跑；但必须有轮数上限，否则异常输入能卡死一个线程
+                rounds += 1
+                metrics.incr("graph.resume_round_total")
+                result = graph.invoke(Command(resume={"approved": req.approved}), config=config)
+    except Exception as exc:  # noqa: BLE001
+        metrics.incr("confirm_error_total")
+        raise HTTPException(status_code=400, detail=f"确认失败，会话可能已失效：{exc}") from exc
+
+    if result.get("__interrupt__"):
+        metrics.incr("confirm_max_rounds_total")
+        raise HTTPException(status_code=409, detail="该分析仍在等待人工确认，请重试或取消")
+
+    final_report = result.get("final_report") or ""
+    update_history_report(thread_id=req.thread_id, final_report=final_report)
+
+    # 回填缓存：这条路径的报告在 confirm 才生成，不回填的话"同一问题第二次提交"
+    # 永远不会命中缓存（差异分析主路径就是这样漏掉的）。
+    # 但降级报告不能回填 —— 否则一次模型抖动会污染 24 小时内的所有同问请求。
+    degraded = bool(result.get("degraded"))
+    pending_key = _pop_pending(req.thread_id)
+    if pending_key and final_report:
+        if degraded:
+            metrics.incr("cache_skip_degraded_total")
+        else:
+            CACHE.set(pending_key, final_report)
+            metrics.incr("cache_write_total")
+            metrics.incr("cache_backfill_from_confirm_total")
+
+    body = {"report": final_report, "request_id": metrics.get_request_id()}
+    if degraded:
+        body["degraded"] = True
+        body["degraded_stages"] = list(result.get("degraded_stages") or [])
+    return body
 
 
-#声明一个"查历史"的 GET
+# ============ 第 10 块：异步任务（提交 → 轮询）============
+@app.post("/analyze_async")
+def analyze_async(asg: AnalizeRequest, user: dict = Depends(get_current_user)):
+    """提交长任务：立刻返回 job_id，前端轮询 /jobs/{id} 拿阶段与结果。"""
+
+    def _job() -> dict:
+        metrics.set_request_id(metrics.new_request_id())  # 任务线程有自己的 ID，日志能对上
+        return _core_analyze(asg, user["user_id"])
+
+    job_id = JOBS.submit(_job)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str, user: dict = Depends(get_current_user)):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    return job
+
+
+# ============ 第 11 块：历史 ============
 @app.get("/history")
-def get_history(user:dict=Depends(get_current_user)):
-    histories=get_history_by_user(user["user_id"])  #  查出这个用户的所有历史（对象列表）
-    # 对象 → 字典，前端才能收 JSON
-    return[
-        {"id":h.id,"user_request":h.user_request,"final_report":h.final_report,
-    "status":h.status,"created_at":h.created_at}
-        for h in histories#把 histories 里每个元素，挨个套进 {...} 这个模板变成新东西
+def get_history(user: dict = Depends(get_current_user)):
+    histories = get_history_by_user(user["user_id"])
+    return [
+        {
+            "id": h.id,
+            "user_request": h.user_request,
+            "final_report": h.final_report,
+            "status": h.status,
+            "created_at": h.created_at,
+        }
+        for h in histories
     ]
+
+
+# ============ 第 12 块：健康检查 + 指标 ============
+def _check_mysql() -> bool:
+    try:
+        from sqlalchemy import text
+
+        from db import engine
+
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@app.get("/healthz")
+def healthz():
+    """依赖健康检查：区分"服务活着"和"依赖可用"。
+
+    Redis 不可用算 degraded 而不是 down —— 缓存层会自动降级到进程内，业务仍可用；
+    MySQL 不可用则鉴权/历史全废，直接 503，让编排系统摘流量。
+    """
+    checks = {
+        "redis": CACHE.ping(),
+        "mysql": _check_mysql(),
+        "graph_checkpointer": "postgres" if os.getenv("USE_POSTGRES", "").lower() == "true" else "memory",
+        "llm_key_configured": bool(os.getenv("DEEPSEEK_API_KEY")),
+    }
+    critical_ok = checks["mysql"]
+    status = "ok" if critical_ok and checks["redis"] else ("degraded" if critical_ok else "down")
+    body = {
+        "status": status,
+        "checks": checks,
+        "cache": CACHE.stats(),
+        "jobs": JOBS.stats(),
+        "uptime_s": metrics.snapshot()["uptime_s"],
+    }
+    return JSONResponse(status_code=200 if critical_ok else 503, content=body)
+
+
+@app.get("/metrics")
+def get_metrics(user: dict = Depends(get_current_user)):
+    """进程内指标：计数器 + 各路由 P50/P90/P95/P99。"""
+    from omics_agent.dataio import csv_cache_info
+
+    snap = metrics.snapshot()
+    snap["cache"] = CACHE.stats()
+    snap["jobs"] = JOBS.stats()
+    snap["csv_cache"] = csv_cache_info()
+    return snap

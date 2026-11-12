@@ -4,9 +4,17 @@
   - LLM 干"懂"的活（①理解需求、⑥解读结果）
   - Python 干"算"的活（②质检、④差异统计、⑤通路富集、⑧拼报告）
   - 人工介入：③人工确认；记忆：②读偏好、⑦写偏好
+
+本轮加固（都在"调用边界"上，不动图拓扑）：
+  - 意图解析：超时 + 重试 + 自纠错，全部失败退回关键词路由 —— 不让流水线死在第一个节点；
+  - 结果解读 / 问答：证据按优先级塞进 token 预算（低优先级的块整块丢弃并显式说明），
+    LLM 调用带超时/重试/熔断；模型彻底不可用时降级为"统计摘要 + 原始证据"，任务仍然出报告；
+  - 数据读取：统一走 dataio.read_csv_cached，一轮分析里同一个大 CSV 只解析一次（实测 0.38s → 0s）。
 """
 
+import logging
 import os
+import re
 from typing import Literal
 
 import pandas as pd
@@ -15,13 +23,22 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
+from omics_agent import metrics
 from omics_agent.config import get_model
+from omics_agent.context import drop_note, fit_blocks
+from omics_agent.dataio import read_csv_cached
 from omics_agent.diff import differential_expression
 from omics_agent.enrichment import enrichment_analysis
-
-from omics_agent.rag import get_gene_function,retrieve_genes
+from omics_agent.rag import get_gene_function, retrieve_genes
 # 一次 import 两个：get_gene_function 精确查名、retrieve_genes 语义检索
-# 把 rag.py 里的「精确查名」函数拿进来用
+from omics_agent.resilience import (
+    CircuitBreaker,
+    keyword_intent,
+    llm_call,
+    structured_output_call,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 # 默认数据目录、分组列名
 DATASET_PATH = "data"
@@ -30,6 +47,14 @@ GROUP_COL = "condition"
 # 长期记忆的命名空间和 key（记忆按"研究者"区分，存各自的分析偏好）
 MEMORY_NS = ("omics",)
 PREFS_KEY = "preferences"
+
+# 送进 LLM 的证据预算（估算 token）。超了就按优先级丢低优先级的块，
+# 而不是让模型的上下文窗口在结尾悄悄截断——截掉的恰好是最关键的解读证据。
+INTERPRET_TOKEN_BUDGET = int(os.getenv("INTERPRET_TOKEN_BUDGET", "6000"))
+QA_TOKEN_BUDGET = int(os.getenv("QA_TOKEN_BUDGET", "3000"))
+
+# 所有 LLM 调用共用一把熔断器：网关持续不可用时快速失败，不再每个请求都等满超时
+LLM_BREAKER = CircuitBreaker("llm", failure_threshold=5, reset_timeout=30.0)
 
 
 #=====1._is_numeric —— 判断"是不是全是数字"===
@@ -54,61 +79,52 @@ def _find_group_col(df:pd.DataFrame)->str | None:
 
 #=====3.输入一个目录，输出识别结果===
 def discover_dataset(dataset_path:str)->dict:
-    #files = [...] 这一段是"列表推导式"，一句话生成一个列表
-    #整句意思：把目录里所有 csv 文件的完整路径，收集成一个列表放进 files。
+    #files = [...] 这一段是"列表推导式"：把目录里所有 csv 文件的完整路径收集成列表
     files=[
         os.path.join(dataset_path,f)
-        #列出 dataset_path 这个目录里所有文件名，返回一个列表
         for f in os.listdir(dataset_path)
-        #f.lower() = 把文件名转小写(防止写成CSV)  判断结尾是不是.csv
-        if f.lower().endswith(".csv")
+        if f.lower().endswith(".csv")  #防止写成 CSV
     ]
     if not files:
         raise ValueError("目录里没有 csv文件")
 
     #========第一步  认表达矩阵=======
-
     expr_file=None
-    for path in files:#遍历每个 csv 文件路径
-        head=pd.read_csv(path,nrows=50)#读 csv 成表格； 只读前 50行
-        #head.shape = 一个 (行数, 列数) 的元组  取第 2 个元素 = 列数
+    for path in files:
+        head=read_csv_cached(path,nrows=50)#只读前 50行；按文件签名缓存，重复调用不重复解析
+        #.shape = (行数, 列数)，取第 2 个元素 = 列数
         if head.shape[1] > 20:
-            #.iloc = 按位置取；[:, 0] = 所有行 : + 第 1 列,即"取第一列"
-            #iloc[:, 1:] = 所有行 + 从第2列到末尾；_is_numeric(...) = 这些列是不是全数字
+            #iloc[:,0]=第一列；iloc[:,1:]=从第2列到末尾
             if head.iloc[:, 0].nunique()==len(head) and _is_numeric(head.iloc[:,1:]):
-                #== len(head)等于行数→ 第一列每行都不重复
-                expr_file=path#两个条件都满足 → 记录"这个文件是表达矩阵"
-                break# 直接跳出整个 for 循环
+                expr_file=path
+                break
     if expr_file is None:
         raise ValueError("没识别出表达矩阵")
 
     #=====第二步 拿样本数=======
-    n_samples=pd.read_csv(expr_file,nrows=0).shape[1]-1#只读表头，不读数据行（只要列名，最快）
-    # .shape表格的 (行数, 列数)  .shape[1] 取第 2 个 = 列数 - 1减掉第一列（基因列
+    n_samples=read_csv_cached(expr_file,nrows=0).shape[1]-1#只读表头，不读数据行（最快）
 
     #=====第三步  用行数找分组表===
     meta_file=go_file=None
     for path in files:
         if path ==expr_file:
             continue
-        # pd.read_csv(path) = 读整个文件 len(...) =这个表的行数
-        n_rows = len(pd.read_csv(path))
+        # 只解析第一列来数行数：比整表解析省内存、省时间（37MB 的矩阵不再重复进内存）
+        n_rows = len(read_csv_cached(path, usecols=[0]))
         if n_rows==n_samples:#行数恰好等于样本数（226）→ 这是分组表
             meta_file=path
         else:
             go_file=path
 
     #=====第 5 块：检查 + 认分组列 + 返回=====
-
     if meta_file is None:
         raise ValueError(f"没识别出分组表（行数应等于样本数 {n_samples}）")
 
-    meta=pd.read_csv(meta_file)#完整读分组表
+    meta=read_csv_cached(meta_file)#完整读分组表
     # 在确定的分组表里认"哪列是分组列"。
     group_col=_find_group_col(meta)
     if group_col is None:
         raise ValueError("分组表里没找到分组列")
-
 
     #=====# 第6块. 返回识别结果=====
     return  {
@@ -130,9 +146,40 @@ class IntentOutput(BaseModel):
 
 
 def parse_intent_node(state: dict) -> dict:
-    """结构化输出：判断用户想做什么分析。"""
-    model = get_model().with_structured_output(IntentOutput)
-    res = model.invoke([HumanMessage(state["user_request"])])
+    """结构化输出：判断用户想做什么分析。
+
+    失败梯度（三级）：结构化输出 → 追加"上次不合格"提示再试 → 关键词规则兜底。
+    后两级是为了保证"模型抽风"不会让整条流水线在第一个节点就 500。
+    """
+    request = state.get("user_request", "")
+
+    def _fallback(exc: Exception) -> IntentOutput:
+        analysis_type = keyword_intent(request)
+        metrics.incr(f"intent_fallback_{analysis_type}_total")
+        LOGGER.warning("意图解析降级为关键词规则（%s）：%s", type(exc).__name__, exc)
+        return IntentOutput(analysis_type=analysis_type)
+
+    # get_model() 必须单独包在 try 里：它一旦抛异常（没配 key / 网关地址错 / SDK 版本不符），
+    # 异常发生在 structured_output_call 的实参求值阶段，重试、自纠错、fallback 全都还没轮到，
+    # 结果就是整条流水线在第一个节点直接 500。这里先把它隔离掉。
+    try:
+        model = get_model()
+    except Exception as exc:  # noqa: BLE001 - 模型造不出来也必须能路由
+        metrics.incr("intent_model_unavailable_total")
+        res = _fallback(exc)
+        metrics.incr(f"intent_{res.analysis_type}_total")
+        return {"analysis_type": res.analysis_type}
+
+    res = structured_output_call(
+        model,
+        IntentOutput,
+        [HumanMessage(request)],
+        timeout_s=float(os.getenv("INTENT_TIMEOUT_S", "45")),
+        attempts=2,
+        breaker=LLM_BREAKER,
+        fallback=_fallback,
+    )
+    metrics.incr(f"intent_{res.analysis_type}_total")
     return {"analysis_type": res.analysis_type}
 
 
@@ -155,16 +202,13 @@ def load_qc_node(state: dict, runtime: Runtime) -> dict:
     go_file=found["go_file"]
     group_col=found["group_col"]
 
-
     #state = 这次任务的记事本（写完就丢）；runtime = 工厂发的工具箱，
     # 里面最有用的是 runtime.store 这个长期记忆档案柜（写完还在）。
-    # 节点想记/想查"用户上次的偏好"，就伸手进工具箱拿档案柜。
-
 
     # 1. 文件在不在
     try:
-        expr_df = pd.read_csv(expr_file)
-        metadata_df = pd.read_csv(meta_file)
+        expr_df = read_csv_cached(expr_file)
+        metadata_df = read_csv_cached(meta_file)
     except FileNotFoundError as e:
         return {"qc_passed": False, "qc_report": f"数据文件缺失：{e}"}
 
@@ -205,7 +249,8 @@ def load_qc_node(state: dict, runtime: Runtime) -> dict:
             fdr_threshold = float(item.value.get("fdr_threshold", 0.05))
             prefs_from_memory = True
     except Exception:
-        pass  # 记忆读不到就用默认阈值，不影响主流程
+        metrics.incr("memory_read_error_total")
+        # 记忆读不到就用默认阈值，不影响主流程
 
     return {
         "qc_passed": True,
@@ -240,20 +285,21 @@ def human_review_node(state: dict) -> dict:
 # ══════════ ④ 差异表达分析 ══════════
 def diff_analysis_node(state: dict) -> dict:
     """调 diff.py 做真实统计，把结果整理成摘要文本。"""
-#从 state 里取出"表达矩阵的文件路径"，再把那个文件读成表格，存进 expr_df
-    expr_df=pd.read_csv(state["expr_file"])#存"表达矩阵"这个表格
-    metadata_df=pd.read_csv(state["meta_file"])
+#从 state 里取出"表达矩阵的文件路径"，再把那个文件读成表格（走缓存，只解析一次）
+    expr_df=read_csv_cached(state["expr_file"])#存"表达矩阵"这个表格
+    metadata_df=read_csv_cached(state["meta_file"])
 
     #调用差异分析函数differential_expression,存差异分析的结果
-    res = differential_expression(
-        expr_df,
-        metadata_df,
-        state["group_col"],
-        group_a=state["group_a"],
-        group_b=state["group_b"],
-        fc_threshold=state.get("fc_threshold", 1.0),
-        fdr_threshold=state.get("fdr_threshold", 0.05),
-    )
+    with metrics.timer("diff.compute_ms"):
+        res = differential_expression(
+            expr_df,
+            metadata_df,
+            state["group_col"],
+            group_a=state["group_a"],
+            group_b=state["group_b"],
+            fc_threshold=state.get("fc_threshold", 1.0),
+            fdr_threshold=state.get("fdr_threshold", 0.05),
+        )
 
     sig = res[res["significant"]]
     significant_count = int(len(sig))
@@ -295,8 +341,8 @@ def enrichment_node(state: dict) -> dict:
         return {"enrichment_summary": "（缺少 GO 注释文件，跳过富集分析）"}
     # ann_file 可能是 None，而 None 不能传给 os.path.exists（会报错），所以先 not ann_file拦一道；
 
-    ann_df=pd.read_csv(ann_file)# 读 GO 注释文件成表格
-    expr_df=pd.read_csv(state["expr_file"])#读表达矩阵
+    ann_df=read_csv_cached(ann_file)# 读 GO 注释文件成表格（缓存，和识别阶段共用一次解析）
+    expr_df=read_csv_cached(state["expr_file"])#读表达矩阵
     #取表达矩阵第一列（基因列）转成列表，作为"背景集"（所有基因）
     background=expr_df.iloc[:,0].tolist()
 
@@ -304,23 +350,24 @@ def enrichment_node(state: dict) -> dict:
     down = state.get("sig_genes_down", [])
 
     parts = []
-    for label, genes in [("上调基因", up), ("下调基因", down)]:
-        if not genes:
-            continue
-        res = enrichment_analysis(genes, ann_df, background)
-        if res.empty:
-            continue
-        sig_terms = res[res["significant"]]
-        if sig_terms.empty:
-            parts.append(f"**{label}**：未发现显著富集的通路。")
-            continue
-        lines = [f"**{label}** 显著富集的通路：", ""]
-        for _, row in sig_terms.head(5).iterrows():
-            lines.append(
-                f"- {row['term']}（显著基因 {row['sig_count']}/{row['bg_count']}，"
-                f"FDR={row['fdr']:.2e}）"
-            )
-        parts.append("\n".join(lines))
+    with metrics.timer("enrichment.compute_ms"):
+        for label, genes in [("上调基因", up), ("下调基因", down)]:
+            if not genes:
+                continue
+            res = enrichment_analysis(genes, ann_df, background)
+            if res.empty:
+                continue
+            sig_terms = res[res["significant"]]
+            if sig_terms.empty:
+                parts.append(f"**{label}**：未发现显著富集的通路。")
+                continue
+            lines = [f"**{label}** 显著富集的通路：", ""]
+            for _, row in sig_terms.head(5).iterrows():
+                lines.append(
+                    f"- {row['term']}（显著基因 {row['sig_count']}/{row['bg_count']}，"
+                    f"FDR={row['fdr']:.2e}）"
+                )
+            parts.append("\n".join(lines))
 
     summary = "\n\n".join(parts) if parts else "未发现显著富集的通路。"
     return {"enrichment_summary": summary}
@@ -333,7 +380,7 @@ def pca_analysis_node(state:dict) ->dict:
     # 和 load_qc 一样先靠内容识别表达矩阵，不依赖别人填好 expr_file
     found = discover_dataset(state.get("dataset_path", DATASET_PATH))
     # 读表达矩阵（行=基因，列=样本）
-    expr_df=pd.read_csv(found["expr_file"])
+    expr_df=read_csv_cached(found["expr_file"])
 
     # iloc[:, 1:] = 跳过第一列基因名，只要数值；values = 转成 numpy 数组
     # astype(float) = 强制变成小数（防止读进来是文本，SVD 会报错）
@@ -347,18 +394,17 @@ def pca_analysis_node(state:dict) ->dict:
 
     # ② SVD 分解：拆成 左奇异向量 × 奇异值 × 右奇异向量
     #    full_matrices=False = 只算有用部分，省内存
-    U,S,Vt=np.linalg.svd(X,full_matrices=False)
+    with metrics.timer("pca.compute_ms"):
+        U,S,Vt=np.linalg.svd(X,full_matrices=False)
     #数学核心：把一堆样本点拆成"几个主轴 +每个样本在轴上的坐标"
 
     # ③ 解释方差比例 = 奇异值平方 / 所有奇异值平方之和
-    #    它回答"这个主成分保留了原数据百分之多少的信息"
     explained=(S ** 2) / (S ** 2).sum()# 算每个主成分的解释比例
 
     # ④ 样本在新坐标轴上的坐标 = U × S
     scores = U * S#样本投影坐标
 
     # ⑤ 拼成摘要文字（前 3 个主成分解释了多少方差）
-    #拼摘要
     summary = (
         f"PCA 完成：共 {X.shape[0]} 个样本，"
         f"PC1 解释 {explained[0]:.1%}，PC2 解释 {explained[1]:.1%}，"
@@ -375,9 +421,7 @@ def cluster_analysis_node(state: dict) -> dict:
     # 和 load_qc 一样先靠内容识别表达矩阵，不依赖别人填好 expr_file
     found = discover_dataset(state.get("dataset_path", DATASET_PATH))
     # 读表达矩阵 → 取数值 → 转置成 样本×基因（和 PCA 一样，每个样本一行）
-    expr_df=pd.read_csv(state["expr_file"])
-    # iloc[:, 1:] = 跳过第一列基因名，只要数值；values = 转成 numpy 数组
-    # astype(float) = 强制变成小数（防止读进来是文本，SVD 会报错）
+    expr_df=read_csv_cached(found["expr_file"])
     X = expr_df.iloc[:, 1:].values.astype(float).T
 
     # k = 要分几群（先写死 3，以后可做成参数）
@@ -388,18 +432,19 @@ def cluster_analysis_node(state: dict) -> dict:
     centers = X[np.random.choice(len(X), k, replace=False)]
 
     # ② 反复迭代：分配 → 重算中心，最多 100 轮
-    for _ in range(100):
-        #算每个样本到 k 个中心的距离平方（开方不影响比较大小，省了）
-        dist = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        labels = dist.argmin(axis=1)  # 每个样本归到"最近"的中心
+    with metrics.timer("cluster.compute_ms"):
+        for _ in range(100):
+            #算每个样本到 k 个中心的距离平方（开方不影响比较大小，省了）
+            dist = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+            labels = dist.argmin(axis=1)  # 每个样本归到"最近"的中心
 
-        # 重算中心：每一簇所有样本的均值
-        new_centers = np.array([X[labels == i].mean(axis=0) for i in range(k)])
+            # 重算中心：每一簇所有样本的均值
+            new_centers = np.array([X[labels == i].mean(axis=0) for i in range(k)])
 
-        # 中心和上一轮几乎一样 → 收敛，停
-        if np.allclose(centers, new_centers):
-            break
-        centers = new_centers
+            # 中心和上一轮几乎一样 → 收敛，停
+            if np.allclose(centers, new_centers):
+                break
+            centers = new_centers
 
     # ③ 统计每簇有几个样本（bincount = 数每个编号出现几次）
     counts = np.bincount(labels, minlength=k)
@@ -411,87 +456,164 @@ def cluster_analysis_node(state: dict) -> dict:
     return {"cluster_summary": summary}
 
 
-
-
-
-
-
-
 # ══════════ ⑥ LLM 解读 ══════════
 def interpret_node(state: dict) -> dict:
-    """LLM 把一堆基因数字翻译成人话。（这次带上每个基因的已知功能）"""
-    model = get_model()
+    """LLM 把一堆基因数字翻译成人话。（这次带上每个基因的已知功能）
 
-    # ── 新加：把 top 显著基因的功能从知识库查出来，拼成「基因功能注释」──
+    两道防线：
+      1. 证据按优先级进 token 预算，被裁掉的块在 prompt 里明说（模型不该假装看全了）；
+      2. 模型不可用（超时/限流/熔断）时降级为"统计摘要"，报告照样出得去。
+    """
     up=state.get("sig_genes_up", [])[:5]       #上调基因列表，只取前 5 个
     down = state.get("sig_genes_down", [])[:5] # 下调基因列表，只取前 5 个
-    # state.get(键, 默认值) = 从记事本里取；没有就返回默认值（空列表
-    # [:5] = 切片，只留前 5 个，防止显著基因太多把 prompt 撑爆
+    # [:5] = 只留前 5 个，防止显著基因太多把 prompt 撑爆
 
     func_lines = []       # 空列表，装「基因功能」的每句话
     for label, genes in [("上调基因", up), ("下调基因", down)]:
-    # for ... in [...] = 循环两轮：第一轮 label="上调基因"、genes=up；第二轮换下调
         for g in genes:  # 再对里面的每个基因名循环
-            desc = get_gene_function(g)  # 调 rag.py 精确查名，拿功能原文
-            if desc:  # desc 不是 None（查到了）才写
+            try:
+                desc = get_gene_function(g)  # 调 rag.py 精确查名，拿功能原文
+            except Exception:            # 知识库读失败不影响主流程：少了注释，统计还在
+                metrics.incr("gene_lookup_error_total")
+                desc = None
+            if desc:  # 查到了才写
                 func_lines.append(f"- {g}：{desc}")
-            # f"- {g}：{desc}" = 拼成一句 "基因名：功能原文" 的 markdown 列表项
 
     gene_funcs = "\n".join(func_lines) if func_lines else "（未检索到功能信息）"
-    # "\n".join(列表) = 用换行符把列表里每句话连成一个多行文本
-    # if ... else ... = 列表里有东西就连；空列表就写一句占位的话
+
+    # 按优先级塞进预算：差异表最不能丢，基因功能最先被裁
+    texts, info = fit_blocks(
+        [
+            {"name": "差异表达", "text": state.get("diff_summary", ""), "priority": 3},
+            {"name": "通路富集", "text": state.get("enrichment_summary", "无"), "priority": 2},
+            {"name": "基因功能注释", "text": gene_funcs, "priority": 1},
+        ],
+        INTERPRET_TOKEN_BUDGET,
+    )
+    metrics.incr("interpret_context_used_tokens", info["used_tokens"])
+    if info["dropped"] or info["truncated"]:
+        metrics.incr("interpret_context_trimmed_total")
+    jobs_note = drop_note(info)
 
     prompt = (
-        "你是一名生物信息学专家。下面是差异表达分析、通路富集分析的结果，"
+        jobs_note
+        + "你是一名生物信息学专家。下面是差异表达分析、通路富集分析的结果，"
         "以及每个显著基因的已知功能。请用通俗的中文解读："
         "哪些基因显著上/下调、它们各自负责什么生物学功能、"
         "显著富集在哪些通路，这些通路可能提示什么生物学意义。\n\n"
         "【差异表达】\n"
-        f"{state['diff_summary']}\n\n"
-        f"（共 {state['significant_count']} 个显著差异基因）\n\n"
+        f"{texts['差异表达']}\n\n"
+        f"（共 {state.get('significant_count', 0)} 个显著差异基因）\n\n"
         "【通路富集】\n"
-        f"{state.get('enrichment_summary', '无')}\n\n"
-        "【基因功能注释】\n"          # ← 新加的这一节，来自知识库检索
-        f"{gene_funcs}"
+        f"{texts['通路富集']}\n\n"
+        "【基因功能注释】\n"
+        f"{texts['基因功能注释']}"
     )
-    res = model.invoke([HumanMessage(prompt)])
-    return {"interpretation": res.content}
+
+    try:
+        with metrics.timer("llm.interpret_ms"):
+            res = llm_call(
+                get_model(),
+                [HumanMessage(prompt)],
+                timeout_s=float(os.getenv("INTERPRET_TIMEOUT_S", "120")),
+                attempts=3,
+                breaker=LLM_BREAKER,
+            )
+        return {"interpretation": res.content}
+    except Exception as exc:  # noqa: BLE001 - 模型彻底不可用也要有报告
+        metrics.incr("interpret_degraded_total")
+        degraded = (
+            f"（模型解读暂不可用：{type(exc).__name__}。以下为统计结果原文）\n\n"
+            f"显著差异基因 {state.get('significant_count', 0)} 个，"
+            f"上调 {len(state.get('sig_genes_up', []))} 个、"
+            f"下调 {len(state.get('sig_genes_down', []))} 个。\n\n"
+            f"{texts['差异表达']}\n\n{texts['通路富集']}"
+        )
+        return {"interpretation": degraded, "degraded": True, "degraded_stages": ["interpret"]}
 
 
 # ══════════ 7 知识库问答（RAG 语义检索） ══════════
+_GENE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]{1,14}")
+
+
+def _exact_lookup(question: str) -> list[tuple[str, str, float]]:
+    """向量检索不可用时的兜底：从问题里抽出疑似基因名，逐个精确查卡片。"""
+    out: list[tuple[str, str, float]] = []
+    for token in _GENE_TOKEN_RE.findall(question or "")[:12]:
+        try:
+            desc = get_gene_function(token.upper())
+        except Exception:  # noqa: BLE001
+            desc = None
+        if desc:
+            out.append((token.upper(), f"{token.upper()}：{desc}", 0.0))
+    return out
+
+
 def qa_node(state: dict) -> dict:
-    """问答节点：用户问开放问题（如"哪些基因和免疫相关"），
-    先拿问题去知识库做语义检索，再让 LLM 依据检索到的基因卡片回答。
+    """问答节点：先拿问题去知识库做语义检索，再让 LLM 依据检索到的卡片回答。
 
     分工：retrieve_genes 负责"找证据"，LLM 负责"照着证据说话"，不瞎编。
+    两级降级：向量检索失败 → 抽基因名做精确查；LLM 失败 → 直接回原始证据。
     """
-    question = state["user_request"]  # 用户问的那句话（从记事本取）
-    hits = retrieve_genes(question, top_k=5)  # 语义检索，返回最像的 5 个基因
+    question = state["user_request"]
+    hits: list = []
+    try:
+        with metrics.timer("rag.retrieve_ms"):
+            hits = retrieve_genes(question, top_k=5)  # 语义检索，返回最像的 5 个基因
+        metrics.incr("qa_retrieval_total")
+    except Exception as exc:  # noqa: BLE001 - 向量库/embedding 服务挂了不能让问答直接 500
+        metrics.incr("qa_retrieval_error_total")
+        hits = _exact_lookup(question)
+        if not hits:
+            return {"qa_answer": f"知识库检索暂不可用（{type(exc).__name__}），请稍后重试。",
+                    "degraded": True, "degraded_stages": ["qa_retrieve"]}
+        metrics.incr("qa_fallback_exact_total")
 
-    if not hits:  # hits 是空列表（一个都没检索到）
+    if not hits:  # 一个都没检索到
         return {"qa_answer": "知识库里没检索到相关基因，换个问法试试。"}
 
-    # 把检索到的 5 张卡片拼成「证据」文本，喂给 LLM
-    # doc[:500] = 每张卡片原文只取前 500 字，防止太长把 prompt 撑爆
-    # doc 开头本来就带基因名（"VEGFD：参与通路…"），所以不再重复拼 gene，用 _ 占位
-    evidence = "\n".join(
-        f"- {doc[:500]}（相似度 {score:.2f}）"
-        for _, doc, score in hits
-    )
-    # "\n".join(...) = 用换行把每一行连成一个大文本；for 挨个取出三元组
+    # 每张卡片按相似度给优先级：预算不够时先丢相关性最低的卡片
+    blocks = []
+    for idx, (_, doc, score) in enumerate(hits):
+        blocks.append({
+            "name": f"卡片{idx + 1}",
+            "text": f"- {doc[:800]}（相似度 {score:.2f}）",
+            "priority": 10.0 - float(idx),  # 保持检索顺序，前面的更相关
+        })
+    texts, info = fit_blocks(blocks, QA_TOKEN_BUDGET)
+    evidence = "\n".join(t for t in texts.values() if t)
+    if info["dropped"]:
+        metrics.incr("qa_evidence_trimmed_total")
 
-    model = get_model()
     prompt = (
-        "你是一名生物信息学助手。下面是根据用户问题从基因知识库检索到的基因卡片，"
+        drop_note(info)
+        + "你是一名生物信息学助手。下面是根据用户问题从基因知识库检索到的基因卡片，"
         "请严格依据这些卡片回答用户的问题，不要编造卡片里没有的功能。"
         "如果卡片信息不足以回答，就如实说明。\n\n"
         f"【用户问题】\n{question}\n\n"
         f"【检索到的基因卡片】\n{evidence}"
     )
-    res = model.invoke([HumanMessage(prompt)])  # 让 LLM 照着证据回答
-    return {"qa_answer": res.content}  # 答案写回记事本
 
-
+    try:
+        with metrics.timer("llm.qa_ms"):
+            res = llm_call(
+                get_model(),
+                [HumanMessage(prompt)],
+                timeout_s=float(os.getenv("QA_TIMEOUT_S", "90")),
+                attempts=3,
+                breaker=LLM_BREAKER,
+            )
+        return {"qa_answer": res.content}  # 答案写回记事本
+    except Exception as exc:  # noqa: BLE001 - 模型挂了就把证据直接交给人看
+        metrics.incr("qa_degraded_total")
+        return {
+            "qa_answer": (
+                f"（模型暂不可用：{type(exc).__name__}。以下是从知识库检索到的原始证据）\n\n"
+                f"{evidence}"
+            ),
+            "degraded": True,
+            "degraded_stages": ["qa_llm"],
+        }
 
 
 # ══════════ 8 写长期记忆 ══════════
@@ -510,7 +632,8 @@ def save_memory_node(state: dict, runtime: Runtime) -> dict:
             },
         )
     except Exception:
-        pass  # 记忆写失败不影响主流程
+        metrics.incr("memory_write_error_total")
+        # 记忆写失败不影响主流程
     return {}
 
 
@@ -523,7 +646,6 @@ def report_node(state: dict) -> dict:
             "final_report": "# 分析报告\n\n当前支持：差异表达(differential)、PCA(pca)、聚类(clustering)。"
         }
 
-
     # 情况2：PCA
     if state.get("analysis_type") == "pca":
         return {
@@ -535,7 +657,6 @@ def report_node(state: dict) -> dict:
         return {
             "final_report": "# 分析报告\n\n## 聚类分析\n\n" + state.get("cluster_summary", "")
         }
-
 
     # 情况4：知识库问答
     if state.get("analysis_type") == "qa":

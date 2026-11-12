@@ -53,3 +53,7 @@ class AnalysisState(TypedDict, total=False):
 
     # ── ⑦ 知识库问答（RAG 语义检索）──
     qa_answer: str  # 问答节点的答案（检索证据 + LLM 生成）
+
+    # ── ⑧ 降级标记（内容质量受损，不能当正品缓存）──
+    degraded: bool        # 是否有节点降级产出（模型不可用 → 只出统计摘要）
+    degraded_stages: list # 哪些阶段降级了，如 ["interpret"]

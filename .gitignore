@@ -12,6 +12,9 @@ data/*.csv
 data/*.npy
 chroma_db/
 
+# 前端上传的临时数据集（运行时产物，不入库）
+data/upload/
+
 # IDE
 .idea/
 .vscode/
