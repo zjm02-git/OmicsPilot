@@ -1,0 +1,75 @@
+{
+  "generated_at": "2026-11-12 21:19:15",
+  "cache_hit_load": {
+    "concurrency": 32,
+    "requests": 512,
+    "completed": 512,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 7.0,
+    "throughput_rps": 73.2,
+    "p50_ms": 153.5,
+    "p90_ms": 237.11,
+    "p95_ms": 312.01,
+    "p99_ms": 339.8,
+    "mean_ms": 164.35
+  },
+  "redis_down": {
+    "status_code": 200,
+    "from_cache": true,
+    "cache_source": "local",
+    "latency_ms": 247.8,
+    "report_ok": true
+  },
+  "retry_ab": {
+    "no_retry": {
+      "success": 145,
+      "trials": 260,
+      "success_rate": 55.8,
+      "llm_calls": 260
+    },
+    "with_retry": {
+      "success": 235,
+      "trials": 260,
+      "success_rate": 90.4,
+      "llm_calls": 416
+    }
+  },
+  "llm_down": {
+    "status_code": 200,
+    "total_s": 0.24,
+    "report_chars": 2326,
+    "degraded_but_served": true
+  },
+  "cold_path": {
+    "runs": [
+      {
+        "analyze_s": 3.96,
+        "status": "pending_confirm",
+        "from_cache": false,
+        "confirm_s": 22.44,
+        "report_chars": 4420,
+        "total_s": 26.4
+      },
+      {
+        "analyze_s": 2.21,
+        "status": "pending_confirm",
+        "from_cache": false,
+        "confirm_s": 18.42,
+        "report_chars": 4073,
+        "total_s": 20.63
+      },
+      {
+        "analyze_s": 2.45,
+        "status": "pending_confirm",
+        "from_cache": false,
+        "confirm_s": 16.56,
+        "report_chars": 3814,
+        "total_s": 19.01
+      }
+    ],
+    "median_total_s": 20.63,
+    "max_total_s": 26.4,
+    "all_cold": true
+  }
+}

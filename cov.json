@@ -1,0 +1,50 @@
+{
+  "files": [
+    {
+      "file": "cache.py",
+      "exec_lines": 176,
+      "covered": 149,
+      "coverage_pct": 84.7
+    },
+    {
+      "file": "context.py",
+      "exec_lines": 74,
+      "covered": 71,
+      "coverage_pct": 95.9
+    },
+    {
+      "file": "dataio.py",
+      "exec_lines": 76,
+      "covered": 59,
+      "coverage_pct": 77.6
+    },
+    {
+      "file": "jobs.py",
+      "exec_lines": 83,
+      "covered": 76,
+      "coverage_pct": 91.6
+    },
+    {
+      "file": "metrics.py",
+      "exec_lines": 94,
+      "covered": 88,
+      "coverage_pct": 93.6
+    },
+    {
+      "file": "resilience.py",
+      "exec_lines": 161,
+      "covered": 146,
+      "coverage_pct": 90.7
+    },
+    {
+      "file": "web.py",
+      "exec_lines": 358,
+      "covered": 205,
+      "coverage_pct": 57.3
+    }
+  ],
+  "total_exec_lines": 1022,
+  "total_covered": 794,
+  "coverage_pct": 77.7,
+  "tests_run": 65
+}
