@@ -15,6 +15,7 @@ from openai import OpenAI
 
 load_dotenv("D:/zj002/多组学数据分析智能体/.env")
 
+
 # ── 1. 读基因卡片 ──────────────────────────────
 cards = pd.read_csv("D:/zj002/多组学数据分析智能体/data/gene_cards.csv")
 print("基因卡片总数：", len(cards))

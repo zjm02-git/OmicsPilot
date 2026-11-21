@@ -249,7 +249,7 @@ python tools/e2e_live.py                         # 真模型端到端（会消�
 - [x] Streamlit 网页界面 + FastAPI 后端 + 账号体系 + Docker 部署
 - [x] 工程化加固：缓存一致性 / 降级 / 熔断重试 / 上下文预算 / 异步任务 / 可观测
 - [x] 自动化测试 + 覆盖率 + 压测与故障注入
-- [ ] Fork 分叉：同一份数据用不同阈值跑两条分支对比
+- [x] Fork 分叉：同一份数据用不同阈值跑两条分支对比
 - [ ] 把 `jobs` 换成 Celery + Redis broker（任务态跨进程）
 - [ ] 指标接 Prometheus + Grafana（当前 `snapshot()` 已按此设计）
 

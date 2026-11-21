@@ -1,0 +1,26 @@
+{
+  "name": "意图路由评测集",
+  "description": "每道题 = 一句话 + 期望路由到的分析类型。类型：differential=差异表达 / pca=主成分 / clustering=聚类 / qa=知识问答 / other=不支持。最后 3 题（18/19/20）是盲区题：语义明确但关键词表没覆盖，用来暴露兜底逻辑的边界。",
+  "cases": [
+    {"id": 1, "question": "帮我找两组样本的差异表达基因", "expected": "differential"},
+    {"id": 2, "question": "哪些基因在肿瘤组显著上调了", "expected": "differential"},
+    {"id": 3, "question": "做一下 DEG 分析", "expected": "differential"},
+    {"id": 4, "question": "帮我画个火山图看看", "expected": "differential"},
+    {"id": 5, "question": "找 log2 fold change 显著的基因", "expected": "differential"},
+    {"id": 6, "question": "做个 PCA 分析", "expected": "pca"},
+    {"id": 7, "question": "主成分分析，看看样本分布", "expected": "pca"},
+    {"id": 8, "question": "能不能降维看一下", "expected": "pca"},
+    {"id": 9, "question": "把这些样本做聚类分析", "expected": "clustering"},
+    {"id": 10, "question": "跑个 KMeans 聚类", "expected": "clustering"},
+    {"id": 11, "question": "样本能分成几群", "expected": "clustering"},
+    {"id": 12, "question": "BRCA1 是什么基因，有什么功能", "expected": "qa"},
+    {"id": 13, "question": "哪些基因参与 DNA 损伤修复", "expected": "qa"},
+    {"id": 14, "question": "介绍一下 TP53", "expected": "qa"},
+    {"id": 15, "question": "这个基因有什么功能", "expected": "qa"},
+    {"id": 16, "question": "今天天气怎么样", "expected": "other"},
+    {"id": 17, "question": "帮我写一封辞职信", "expected": "other"},
+    {"id": 18, "question": "想直观看看这些样本长什么样", "expected": "pca"},
+    {"id": 19, "question": "这些样本是不是能分成几个亚型", "expected": "clustering"},
+    {"id": 20, "question": "TP53 和乳腺癌有关系吗", "expected": "qa"}
+  ]
+}

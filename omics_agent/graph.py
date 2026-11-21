@@ -16,6 +16,7 @@
 """
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
 from omics_agent import config, nodes
 from omics_agent.state import AnalysisState
@@ -40,9 +41,23 @@ def route_after_qc(state: dict) -> str:
     return "human_review" if state.get("qc_passed", False) else "report"
 
 
-def route_after_review(state: dict) -> str:
-    """③ 人工确认之后的分叉：批准继续分析，取消直接出报告。"""
-    return "diff_analysis" if state.get("qc_passed", False) else "report"
+def route_after_review(state: dict):
+    """③ 人工确认之后：批准 → Send 分叉两条 diff_analysis（不同阈值）；取消 → 报告。
+
+    Send 让 human_review 一次发出多个并行任务到 diff_analysis，各带一组
+    fc/fdr 阈值，跑完由 compare_thresholds 汇合对比（LangGraph 自动并行 + join）。
+    """
+    if not state.get("qc_passed", False):
+        return "report"  # 取消：单字符串，直接走报告
+
+    fc = state.get("fc_threshold", 1.0)
+    fdr = state.get("fdr_threshold", 0.05)
+    return [
+        # 主阈值：用户/记忆的当前阈值（后续富集、解读用它的结果）
+        Send("diff_analysis", {**state, "fc_threshold": fc, "fdr_threshold": fdr}),
+        # 严格阈值：fc 翻倍、fdr 收紧 5 倍，用来对比阈值松紧对结果的影响
+        Send("diff_analysis", {**state, "fc_threshold": round(fc * 2, 2), "fdr_threshold": round(fdr / 5, 4)}),
+    ]
 
 
 def build_graph():
@@ -59,6 +74,7 @@ def build_graph():
     builder.add_node("load_qc", nodes.load_qc_node)
     builder.add_node("human_review", nodes.human_review_node)
     builder.add_node("diff_analysis", nodes.diff_analysis_node)
+    builder.add_node("compare_thresholds", nodes.compare_thresholds_node)  # ← Fork 汇合点
     builder.add_node("enrichment", nodes.enrichment_node)
     builder.add_node("interpret", nodes.interpret_node)
     builder.add_node("save_memory", nodes.save_memory_node)
@@ -96,7 +112,8 @@ def build_graph():
 
     builder.add_edge("qa_node", "report")  # ← 新加：问答完直接出报告
 
-    builder.add_edge("diff_analysis", "enrichment")
+    builder.add_edge("diff_analysis", "compare_thresholds")  # 并行分支先汇合对比
+    builder.add_edge("compare_thresholds", "enrichment")
     builder.add_edge("enrichment", "interpret")
     builder.add_edge("interpret", "save_memory")
     builder.add_edge("save_memory", "report")

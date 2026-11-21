@@ -214,9 +214,9 @@ _INTENT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("differential", ("差异", "上调", "下调", "log2fc", "log2fold", "fold change", "火山图",
                       "differential", "deg", "显著基因")),
     ("pca", ("pca", "主成分", "降维", "principal component", "variance")),
-    ("clustering", ("聚类", "分群", "cluster", "kmeans", "k-means", "分组模式")),
+    ("clustering", ("聚类", "分群", "cluster", "kmeans", "k-means", "分组模式", "亚型", "几群")),
     ("qa", ("哪些基因", "什么功能", "功能是", "参与", "通路", "注释", "介绍一下",
-            "知识库", "相关基因", "什么是")),
+            "知识库", "相关基因", "什么是", "有关系")),
 )
 
 

@@ -104,7 +104,7 @@ def discover_dataset(dataset_path:str)->dict:
     #=====第二步 拿样本数=======
     n_samples=read_csv_cached(expr_file,nrows=0).shape[1]-1#只读表头，不读数据行（最快）
 
-    #=====第三步  用行数找分组表===
+    #=====第三步  用行数找分组表 + 认 GO 注释表=====
     meta_file=go_file=None
     for path in files:
         if path ==expr_file:
@@ -113,7 +113,12 @@ def discover_dataset(dataset_path:str)->dict:
         n_rows = len(read_csv_cached(path, usecols=[0]))
         if n_rows==n_samples:#行数恰好等于样本数（226）→ 这是分组表
             meta_file=path
-        else:
+            continue
+        # GO 注释表的特征：有 gene + term 两列。基因卡片(gene,description)等其它表
+        # 行数也≠样本数，会被误认成 go_file，导致 enrichment 里 groupby("term") 报
+        # KeyError。这里按列名精确认，不靠行数猜。
+        cols = read_csv_cached(path, nrows=0).columns.tolist()
+        if "gene" in cols and "term" in cols:
             go_file=path
 
     #=====第 5 块：检查 + 认分组列 + 返回=====
@@ -309,6 +314,10 @@ def diff_analysis_node(state: dict) -> dict:
     expr_df=read_csv_cached(state["expr_file"])#存"表达矩阵"这个表格
     metadata_df=read_csv_cached(state["meta_file"])
 
+    # 阈值从 state 取：Fork 分叉时每个 Send 分支带不同阈值，各自算各自的结果
+    fc_threshold = state.get("fc_threshold", 1.0)
+    fdr_threshold = state.get("fdr_threshold", 0.05)
+
     #调用差异分析函数differential_expression,存差异分析的结果
     with metrics.timer("diff.compute_ms"):
         res = differential_expression(
@@ -317,8 +326,8 @@ def diff_analysis_node(state: dict) -> dict:
             state["group_col"],
             group_a=state["group_a"],
             group_b=state["group_b"],
-            fc_threshold=state.get("fc_threshold", 1.0),
-            fdr_threshold=state.get("fdr_threshold", 0.05),
+            fc_threshold=fc_threshold,
+            fdr_threshold=fdr_threshold,
         )
 
     sig = res[res["significant"]]
@@ -342,11 +351,50 @@ def diff_analysis_node(state: dict) -> dict:
             )
         diff_summary = "\n".join(lines)
 
+    # 返回一条「阈值结果记录」，交给 state 的 reducer(operator.add) 合并进列表。
+    # 不再直接写 diff_summary 等单值字段——并行分支会互相覆盖，改由 compare 节点挑主结果写回。
     return {
-        "diff_summary": diff_summary,
-        "significant_count": significant_count,
-        "sig_genes_up": sig_genes_up,
-        "sig_genes_down": sig_genes_down,
+        "threshold_results": [{
+            "fc_threshold": fc_threshold,
+            "fdr_threshold": fdr_threshold,
+            "significant_count": significant_count,
+            "sig_genes_up": sig_genes_up,
+            "sig_genes_down": sig_genes_down,
+            "diff_summary": diff_summary,
+        }],
+    }
+
+
+# ══════════ ④.5 Fork 汇合：阈值对比 ══════════
+def compare_thresholds_node(state: dict) -> dict:
+    """Fork 汇合点：对比各阈值分支的结果，挑出主结果写回单值字段。
+
+    主结果 = fc_threshold 与「fork 前用户阈值」一致的那条（默认/记忆阈值那条）。
+    严格阈值那条只用于对比展示，不改变后续富集/解读用的主结果。
+    """
+    results = state.get("threshold_results", [])
+    if not results:
+        return {"compare_summary": "（无阈值对比结果）"}
+
+    # 对比表：一行一组阈值
+    lines = ["| 阈值组合 | 显著基因数 | 上调 | 下调 |", "| --- | --- | --- | --- |"]
+    for r in results:
+        lines.append(
+            f"| |log2FC|>{r['fc_threshold']}, FDR<{r['fdr_threshold']} "
+            f"| {r['significant_count']} | {len(r['sig_genes_up'])} | {len(r['sig_genes_down'])} |"
+        )
+    compare_summary = "\n".join(lines)
+
+    # 挑主结果：阈值等于 fork 前用户阈值的那条
+    main_fc = state.get("fc_threshold", 1.0)
+    main = next((r for r in results if r["fc_threshold"] == main_fc), results[0])
+
+    return {
+        "compare_summary": compare_summary,
+        "diff_summary": main["diff_summary"],
+        "significant_count": main["significant_count"],
+        "sig_genes_up": main["sig_genes_up"],
+        "sig_genes_down": main["sig_genes_down"],
     }
 
 
@@ -704,6 +752,9 @@ def report_node(state: dict) -> dict:
         f"FDR < {state.get('fdr_threshold', 0.05)}（{param_src}）",
         "",
         state.get("diff_summary", ""),
+        "",
+        "### 阈值对比（Fork 并行试了两组阈值）",
+        state.get("compare_summary", "（无对比）"),
         "",
         "## 三、通路富集分析",
         state.get("enrichment_summary", "无显著富集通路"),

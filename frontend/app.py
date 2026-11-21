@@ -1,5 +1,7 @@
 '''streamlit前端'''
-
+#这是依赖健康检查
+#http://localhost:8000/healthz
+#http://localhost:8000/metrics
 import streamlit as st
 import requests#专门用来发 HTTP 请求（调你的 FastAPI 接口）
 import os

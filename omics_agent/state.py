@@ -4,7 +4,8 @@
 total=False 表示这些字段不是一开始就全有，而是流程走到哪一步填哪一步。
 """
 
-from typing import TypedDict
+import operator
+from typing import Annotated, TypedDict
 
 
 class AnalysisState(TypedDict, total=False):
@@ -38,6 +39,10 @@ class AnalysisState(TypedDict, total=False):
     significant_count: int  # 显著差异基因的数量
     sig_genes_up: list    # 上调显著基因名列表
     sig_genes_down: list  # 下调显著基因名列表
+
+    # ── ③.5 Fork 分叉：多组阈值并行对比 ──
+    threshold_results: Annotated[list, operator.add]  # 各阈值分支的结果（Send 并行后 reducer 合并）
+    compare_summary: str  # 阈值对比摘要（表格）
 
     # ── ④ 无监督分析的结果 ──
     pca_summary: str    # PCA 分析摘要（主成分解释比例等)

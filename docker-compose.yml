@@ -50,6 +50,8 @@ services:
       # ← 新增：框架状态库（主机名是 postgres，不是 localhost）
       USE_POSTGRES: "true"
     # ← 新增：打开开关，checkpointer 才切 Postgres；不设就退回内存版
+    volumes:
+      - .:/app   # 全挂项目：改任何代码（omics_agent/web.py/db.py/evals/...）立即生效，不用 docker cp / build
     ports:
       - "8000:8000"
     depends_on:
