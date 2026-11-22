@@ -62,8 +62,30 @@ graph = build_graph()
 
 # 缓存与任务注册表：进程内单例
 CACHE = ReportCache()
-JOBS = jobs_mod.JobRegistry(max_workers=int(os.getenv("JOB_WORKERS", "4")))
 redis_client = CACHE.redis  # 兼容旧代码里对 redis_client 的引用
+# 队列要长阻塞读（XREADGROUP BLOCK），不能用缓存那条 socket_timeout=2s 的连接（2s 一到就被打断），
+# 单独建一条不限 socket 超时的连接给 worker 消费用。
+_queue_redis = None
+if redis_client is not None:
+    try:
+        import redis as _redis
+
+        _queue_redis = _redis.Redis(
+            host=os.getenv("REDIS_HOST", "127.0.0.1"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            socket_timeout=None,          # 阻塞读：等多久由 BLOCK 决定，不受 socket 超时打断
+            socket_connect_timeout=5.0,
+            decode_responses=True,
+        )
+        _queue_redis.ping()
+    except Exception:  # noqa: BLE001 - Redis 真不可用时队列退化为不可用，submit 会明确报错
+        _queue_redis = None
+JOBS = jobs_mod.JobRegistry(
+    redis_client=_queue_redis,
+    ttl=int(os.getenv("JOB_TTL_S", "3600")),
+    visible_timeout_s=float(os.getenv("JOB_VISIBLE_TIMEOUT_S", "60")),
+    max_retries=int(os.getenv("JOB_MAX_RETRIES", "3")),
+)
 
 # ============ 第 2 块：JWT 配置常量 ============
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -447,6 +469,17 @@ def _core_analyze(asg: AnalizeRequest, history_user_id: int) -> dict:
         return _run_and_cache(asg, dataset_path, key, history_user_id)
 
 
+def _handle_analyze_task(payload: dict) -> dict:
+    """worker 侧执行：反序列化参数，跑一次分析（在独立 worker 进程里执行）。"""
+    asg = AnalizeRequest(**payload["asg"])
+    metrics.set_request_id(metrics.new_request_id())
+    return _core_analyze(asg, payload["user_id"])
+
+
+# 注册任务类型 → 处理函数（worker import web 时执行到这里，自动完成注册）
+JOBS.register("analyze", _handle_analyze_task)
+
+
 @app.post("/analyze")
 def analyze(asg: AnalizeRequest, user: dict = Depends(get_current_user)):
     """同步分析：跑完才返回。适合前端愿意等，或已命中缓存的场景。"""
@@ -503,13 +536,11 @@ def confirm(req: ConfirmRequest, user: dict = Depends(get_current_user)):
 # ============ 第 10 块：异步任务（提交 → 轮询）============
 @app.post("/analyze_async")
 def analyze_async(asg: AnalizeRequest, user: dict = Depends(get_current_user)):
-    """提交长任务：立刻返回 job_id，前端轮询 /jobs/{id} 拿阶段与结果。"""
-
-    def _job() -> dict:
-        metrics.set_request_id(metrics.new_request_id())  # 任务线程有自己的 ID，日志能对上
-        return _core_analyze(asg, user["user_id"])
-
-    job_id = JOBS.submit(_job)
+    """提交长任务：写状态 + 入 Redis Stream 队列，立刻返回 job_id，前端轮询 /jobs/{id}。"""
+    try:
+        job_id = JOBS.submit("analyze", {"asg": asg.model_dump(), "user_id": user["user_id"]})
+    except Exception as exc:  # noqa: BLE001 - Redis 不可用时队列不可用
+        raise HTTPException(status_code=503, detail=f"任务队列不可用：{exc}") from exc
     return {"job_id": job_id, "status": "queued"}
 
 

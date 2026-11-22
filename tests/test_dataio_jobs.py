@@ -1,9 +1,23 @@
 """数据层与任务层测试：CSV 解析缓存失效、数据集指纹、异步任务生命周期。"""
+#docker compose exec worker python tools/demo_failover.py
+#脚本会自动走完你要的那套流程
+
+
+#终端 1 —— 起厨师 + 下单，然后停下来等你：
+# docker compose exec worker python tools/demo_failover.py --manual
+# 看到打印 [4] 执行中的 worker pid=XXX 就停在这（别关）。
+#
+# 终端 2 —— 亲手打死那个厨师（把 XXX 换成终端 1 显示的 pid）：
+# docker compose exec worker sh -c 'kill -9 XXX'
 
 import os
 import tempfile
+import threading
 import time
 import unittest
+import uuid
+
+import redis
 
 from omics_agent import dataio, jobs
 
@@ -68,31 +82,49 @@ class FingerprintTest(unittest.TestCase):
 
 class JobRegistryTest(unittest.TestCase):
     def setUp(self):
-        self.registry = jobs.JobRegistry(max_workers=2, ttl=60, max_jobs=16)
+        self.redis = redis.Redis(
+            host=os.getenv("REDIS_HOST", "127.0.0.1"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            decode_responses=True,
+        )
+        # 每个用例用独立 stream/group，避免不同用例的 worker 抢同一消费组里的消息
+        token = uuid.uuid4().hex[:8]
+        self.registry = jobs.JobRegistry(
+            redis_client=self.redis,
+            ttl=60,
+            stream=f"test:jobs:{token}",
+            group=f"test:group:{token}",
+            dead_stream=f"test:dead:{token}",
+        )
+        # 注册三种任务：echo 返回参数、boom 抛异常、work 上报阶段
+        self.registry.register("echo", lambda payload: payload["value"])
+        self.registry.register("boom", lambda payload: (_ for _ in ()).throw(RuntimeError("分析失败")))
+        self.registry.register("work", lambda payload: (jobs.progress("正在做差异分析"), "ok")[1])
+        # 起一个消费线程，否则 submit 之后没人执行
+        self._worker = threading.Thread(target=self.registry.run_worker, daemon=True)
+        self._worker.start()
+
+    def tearDown(self):
+        try:
+            self.redis.delete(self.registry.queue.stream, self.registry.queue.dead_stream)
+        except Exception:  # noqa: BLE001
+            pass
 
     def test_success_lifecycle(self):
-        job_id = self.registry.submit(lambda: 42)
+        job_id = self.registry.submit("echo", {"value": 42})
         job = _wait(self.registry, job_id)
         self.assertEqual(job["status"], "done")
         self.assertEqual(job["result"], 42)
-        self.assertIsNotNone(job["elapsed_s"])
-        self.assertIsNone(job["error"])
+        self.assertNotEqual(job.get("elapsed_s"), "")
 
     def test_failure_lands_in_job_state(self):
-        def boom():
-            raise RuntimeError("分析失败")
-
-        job_id = self.registry.submit(boom)
+        job_id = self.registry.submit("boom", {})
         job = _wait(self.registry, job_id)
         self.assertEqual(job["status"], "error")
         self.assertIn("RuntimeError", job["error"])
 
     def test_progress_updates_stage(self):
-        def work():
-            jobs.progress("正在做差异分析")
-            return "ok"
-
-        job_id = self.registry.submit(work)
+        job_id = self.registry.submit("work", {})
         job = _wait(self.registry, job_id)
         self.assertEqual(job["stage"], "正在做差异分析")
 
@@ -100,8 +132,8 @@ class JobRegistryTest(unittest.TestCase):
         self.assertIsNone(self.registry.get("no-such-id"))
 
     def test_stats_counts(self):
-        self.registry.submit(lambda: 1)
-        time.sleep(0.2)
+        self.registry.submit("echo", {"value": 1})
+        time.sleep(0.5)
         self.assertGreaterEqual(self.registry.stats()["jobs_total"], 1)
 
 

@@ -51,7 +51,7 @@
 | `omics_agent/resilience.py` | 模型网关超时 / 502 / 限流 / 结构化输出解析失败 | 线程池硬超时；指数退避 + 抖动重试；三态熔断；自纠错重试 → 关键词规则兜底 |
 | `omics_agent/context.py` | prompt 悄悄顶满上下文、被截断的恰是最重要证据 | 按 priority 装 token 预算；被裁块在 prompt 中显式声明 |
 | `omics_agent/dataio.py` | 37MB CSV 一轮分析被解析 3~4 次 | 按 `(mtime, size, kwargs)` 签名缓存解析结果；数据集指纹 |
-| `omics_agent/jobs.py` | 25s 长任务占死 HTTP 连接 | 线程池 + 任务注册表 + 阶段进度，接口可平移 Celery/RabbitMQ |
+| `omics_agent/jobs.py` + `queue.py` | 25s 长任务占死 HTTP 连接 | Redis Stream 真队列（XADD→XREADGROUP→XACK→XAUTOCLAIM→死信），kill -9 不丢任务 |
 | `omics_agent/metrics.py` | 出问题只能猜"哪慢、命中没、是哪个请求" | 零依赖计数器 + 环形采样分位数 + `contextvars` 请求 ID |
 | `web.py`（重写） | 每个上层能力都要在 HTTP 层落地 | 幂等缓存键、single-flight、`/healthz`、`/metrics`、`/analyze_async`、路径穿越校验、降级结果不入缓存 |
 
@@ -116,6 +116,7 @@
 ├── db.py                    # SQLAlchemy 模型（users / analysis_history）
 ├── app.py                   # CLI 入口：跑一次完整分析（含回溯重跑）
 ├── backtrack_demo.py        # 回溯（时间旅行）演示
+├── worker.py               # 独立 worker 进程：消费 Redis Stream 任务
 ├── omics_agent/             # 核心包
 │   ├── config.py            # 读配置、造模型、造检查点/记忆（工厂模式）
 │   ├── state.py             # State 定义（含 degraded 降级标记）
@@ -128,19 +129,21 @@
 │   ├── resilience.py        # 韧性层：超时 / 重试 / 熔断 / 结构化输出兜底
 │   ├── context.py           # 上下文预算：按优先级裁剪证据 + 裁剪声明
 │   ├── dataio.py            # CSV 解析缓存 + 数据集指纹
-│   ├── jobs.py              # 异步任务注册表（线程池 + 阶段进度）
+│   ├── jobs.py              # 异步任务注册表（状态存 Redis Hash，队列走 Stream）
+│   ├── queue.py             # Redis Stream 队列（XADD/XREADGROUP/XAUTOCLAIM/死信）
 │   └── metrics.py           # 零依赖指标：计数器 + P50/P95/P99 + 请求 ID
 ├── frontend/app.py          # Streamlit 前端
 ├── tests/                   # 73 个 unittest 用例（含 8 个 Web 集成测试）
 ├── tools/
 │   ├── coverage_report.py   # 自建覆盖率工具（compile + settrace，无需 coverage 包）
 │   ├── bench.py             # 压测 / 故障注入（缓存命中、冷路径、Redis 挂、LLM 挂、重试 A/B）
-│   └── e2e_live.py          # 真模型端到端烟测（默认不进回归）
+│   ├── e2e_live.py          # 真模型端到端烟测（默认不进回归）
+│   └── demo_failover.py     # 容错演示：kill -9 worker 任务被接走
 ├── bench/last_run.json      # 最近一次压测结果（可复核）
 ├── cov.json                 # 最近一次覆盖率结果
 ├── data/                    # 数据（fetch_tcga.py / fetch_go.py / generate_data.py）
 ├── docs/                    # 项目文档 + 工程化升级说明
-├── docker-compose.yml       # mysql / postgres / redis / backend / frontend
+├── docker-compose.yml       # mysql / postgres / redis / backend / worker / frontend
 ├── requirements.txt
 └── .env.example
 ```
@@ -232,7 +235,7 @@ python tools/e2e_live.py                         # 真模型端到端（会消�
 
 ## 八、已知取舍（写在明面上）
 
-- **异步用线程池而非 Celery/RabbitMQ**：项目还没到跨进程/跨机的量级，但 `jobs.submit/get` 接口是照着队列语义设计的，换实现不换调用方。任务态在进程内，重启即失效，因此同时写 MySQL 历史兜底。
+- **异步用 Redis Stream 而非 Celery/RabbitMQ**：环境装不了 Celery，但 Redis 现成，于是手写 Redis Stream 真队列（XREADGROUP 消费组 / XAUTOCLAIM 超时接管 / 死信 / 幂等去重），`jobs.submit/get` 接口不变。代价是 at-least-once 而非 exactly-once，幂等要自己兜。
 - **指标是进程内自建的，不是 Prometheus**：环境装不了 prometheus_client，`snapshot()` 换成 `Counter/Histogram` 时语义一致、结构不用动。
 - **覆盖率工具是自己写的**：`coverage.py` 同样装不上，用 `compile()` 取可执行行 + `sys.settrace` 统计命中，误差来自"装饰器/多行语句"的行归属，量级可接受。
 - **集成测试用假模型**：`mock.patch` 只在测试进程内生效，生产仍走真 DeepSeek；真模型链路由 `tools/e2e_live.py` 单独验证。
@@ -250,7 +253,7 @@ python tools/e2e_live.py                         # 真模型端到端（会消�
 - [x] 工程化加固：缓存一致性 / 降级 / 熔断重试 / 上下文预算 / 异步任务 / 可观测
 - [x] 自动化测试 + 覆盖率 + 压测与故障注入
 - [x] Fork 分叉：同一份数据用不同阈值跑两条分支对比
-- [ ] 把 `jobs` 换成 Celery + Redis broker（任务态跨进程）
+- [x] 把 `jobs` 换成 Redis Stream 真队列（任务态跨进程、kill -9 不丢）
 - [ ] 指标接 Prometheus + Grafana（当前 `snapshot()` 已按此设计）
 
 ---

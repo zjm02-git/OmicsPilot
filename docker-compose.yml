@@ -62,6 +62,29 @@ services:
       redis:
         condition: service_started     # redis 秒启动、无初始化，只要容器起来就行，不用探活
 
+  # ── worker：独立消费 Redis Stream 任务队列，和 backend 解耦 ──
+  # 扩容：docker compose up --scale worker=3，多个 worker 共享同一消费组并发执行；
+  # 演示容错：kill -9 掉一个 worker 容器，它 PEL 里没确认的任务会被存活的 worker 用 XAUTOCLAIM 接走。
+  worker:
+    build: .
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+      MYSQL_URL: mysql+pymysql://root:123456@mysql:3306/omics
+      DATABASE_URL: postgresql://langgraph_user:123456@postgres:5432/langgraph_db?sslmode=disable
+      USE_POSTGRES: "true"
+    volumes:
+      - .:/app
+    command: python worker.py     # 入口：worker.py → web.JOBS.run_worker() 阻塞消费
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
   frontend:
     build: ./frontend
     environment:
