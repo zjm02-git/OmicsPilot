@@ -16,12 +16,16 @@
   - tools 节点：真正执行工具，把结果作为 ToolMessage 塞回对话；
   - 条件边 should_continue：模型还想调工具 → 回 tools；否则 → END。
 
-目前有 5 个工具（4 种分析能力 + 1 个联网文献检索）：
+目前有 9 个工具（5 个分析/检索 + 2 个 Skill 技能库 + 2 个 MCP 数据库）：
   query_gene          基因知识问答（先精确查名，再语义检索）
   run_differential    差异表达分析（找显著上/下调基因）
   run_pca             主成分分析（看样本分布）
   run_clustering      KMeans 聚类（看样本分几群）
   search_literature   检索 PubMed 文献（联网，拿标题+摘要）
+  list_skills         列出可用的技能（Skill）清单
+  load_skill          加载某个技能的完整说明（SKILL.md 正文）
+  mcp_get_user_count  统计注册用户数（MCP 协议连数据库 server）
+  mcp_get_history     查某用户最近分析历史（MCP 协议连数据库 server）
 
 用法（项目根目录）：
     python -B omics_agent/agent.py                       # 默认跑一个组合问题
@@ -51,6 +55,7 @@ from omics_agent.dataio import read_csv_cached  # noqa: E402
 from omics_agent.diff import differential_expression  # noqa: E402
 from omics_agent.nodes import DATASET_PATH, discover_dataset  # noqa: E402
 from omics_agent.rag import get_gene_function, retrieve_genes  # noqa: E402
+from omics_agent.mcp_client import MCP_TOOLS  # noqa: E402
 from omics_agent.resilience import call_with_retry  # noqa: E402
 
 # 抽「疑似基因名」的正则（和 nodes.py 里的一样）：BRCA1、TP53 这类
@@ -200,7 +205,59 @@ def search_literature(query: str, max_results: int = 3) -> str:
     return call_with_retry(_fetch, attempts=2, label="literature")
 
 
-TOOLS = [query_gene, run_differential, run_pca, run_clustering, search_literature]
+# ── Skill 技能库：把「固定工作流」打包成 SKILL.md，模型用到才加载 ──
+SKILLS_DIR = os.path.join(ROOT, "skills")
+
+
+def _read_skill_description(skill_md: str) -> str:
+    """从 SKILL.md 里抽一行 description 做列表摘要，读不到就留空。"""
+    try:
+        with open(skill_md, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("description:"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:  # noqa: BLE001 - 技能文件读不到不致命，返回空描述
+        return ""
+    return ""
+
+
+# ── 工具 6：列出技能清单 ──
+@tool
+def list_skills() -> str:
+    """列出当前可用的技能（Skill）清单，每项一行「技能名：一句话说明」。
+
+    当用户想先看看「你能做什么 / 有哪些工作流」时调用；
+    或不确定该用哪个技能时，先列出来让用户选。
+    """
+    if not os.path.isdir(SKILLS_DIR):
+        return "技能库为空（skills 目录不存在）。"
+    lines = []
+    for name in sorted(os.listdir(SKILLS_DIR)):
+        skill_md = os.path.join(SKILLS_DIR, name, "SKILL.md")
+        if not os.path.isfile(skill_md):
+            continue
+        desc = _read_skill_description(skill_md)
+        lines.append(f"- {name}：{desc}" if desc else f"- {name}")
+    return "\n".join(lines) if lines else "技能库为空。"
+
+
+# ── 工具 7：加载某个技能 ──
+@tool
+def load_skill(name: str) -> str:
+    """加载某个技能的完整说明（SKILL.md 正文），返回该技能的操作步骤。
+
+    当确定要执行某个技能时调用。name 是技能名（如 differential），
+    先调 list_skills 看有哪些技能、名字分别是什么。
+    """
+    skill_md = os.path.join(SKILLS_DIR, name, "SKILL.md")
+    if not os.path.isfile(skill_md):
+        return f"没有名为「{name}」的技能，先调 list_skills 看看有哪些。"
+    with open(skill_md, encoding="utf-8") as f:
+        return f.read()
+
+
+TOOLS = [query_gene, run_differential, run_pca, run_clustering, search_literature,
+         list_skills, load_skill, *MCP_TOOLS]
 
 
 def build_agent_graph():

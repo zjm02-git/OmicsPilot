@@ -17,3 +17,4 @@ pandas
 numpy
 scipy
 psycopg[binary]
+mcp
