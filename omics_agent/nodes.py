@@ -340,12 +340,17 @@ def diff_analysis_node(state: dict) -> dict:
     if top.empty:
         diff_summary = "未找到显著差异表达基因。"
     else:
+        # log2FC 是 group_b 相对 group_a 的差值，参照组必须写进表头：
+        # 只写"上调/下调"而不写"谁相对谁"，读者会把方向读反。
+        _ga, _gb = state["group_a"], state["group_b"]
         lines = [
-            "| 基因 | log2FC | FDR | 变化方向 |",
+            f"| 基因 | log2FC（{_gb} vs {_ga}） | FDR | 变化方向 |",
             "| --- | --- | --- | --- |",
         ]
         for _, row in top.iterrows():
-            direction = "上调" if row["log2fc"] > 0 else "下调"
+            direction = (
+                f"{_gb} 中更高" if row["log2fc"] > 0 else f"{_ga} 中更高"
+            )
             lines.append(
                 f"| {row['gene']} | {row['log2fc']:.2f} | {row['fdr']:.2e} | {direction} |"
             )
@@ -419,7 +424,11 @@ def enrichment_node(state: dict) -> dict:
 
     parts = []
     with metrics.timer("enrichment.compute_ms"):
-        for label, genes in [("上调基因", up), ("下调基因", down)]:
+        _ga, _gb = state["group_a"], state["group_b"]
+        for label, genes in [
+            (f"在 {_gb} 中更高的基因", up),
+            (f"在 {_ga} 中更高的基因", down),
+        ]:
             if not genes:
                 continue
             res = enrichment_analysis(genes, ann_df, background)

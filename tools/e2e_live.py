@@ -58,7 +58,8 @@ def main() -> int:
     user_id = client.get("/me", headers=headers).json()["user_id"]
 
     dataset = os.path.abspath(os.path.join(ROOT, args.dataset))
-    cache_key = build_key(args.question, dataset)
+    # 缓存 key 含用户维度（报告依赖该用户自己的阈值偏好），必须用登录后的 user_id 算
+    cache_key = build_key(args.question, dataset, user_id=user_id)
     web.CACHE.delete(cache_key)  # 必须清掉，否则可能命中旧缓存、根本没调模型
 
     summary: dict = {

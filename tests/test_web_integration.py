@@ -88,9 +88,11 @@ def _make_dataset(dir_path: str, n_genes: int = 120, n_per_group: int = 20, seed
     samples = [f"S{i:02d}" for i in range(n_per_group * 2)]
     genes = [f"GENE{i:03d}" for i in range(n_genes)]
 
-    mat = rng.normal(100.0, 8.0, size=(n_genes, len(samples)))
-    # 前 12 个基因在 B 组翻 3 倍 → log2fc ≈ 1.58 > 1，必然被判定为显著
-    mat[:12, n_per_group:] += 200.0
+    # 值空间必须是 log2（与 fetch_tcga.py / generate_data.py 同一契约）。
+    # 线性量纲 100→300 会让 log2fc 变成 200，恰好掩盖了"双重取对数"的口径错误。
+    mat = rng.normal(8.0, 0.5, size=(n_genes, len(samples)))
+    # 前 12 个基因在 B 组高 3 倍 → log2fc = log2(3) ≈ 1.585 > 1，必然显著
+    mat[:12, n_per_group:] += np.log2(3.0)
 
     expr = pd.DataFrame(mat, columns=samples)
     expr.insert(0, "gene", genes)
@@ -141,7 +143,7 @@ class WebIntegrationTest(unittest.TestCase):
         # 清缓存（含 pending）与临时数据集，别给下一次运行留脏状态
         for tid in cls.created_threads:
             web.CACHE.delete(f"pending:{tid}")
-        web.CACHE.delete(build_key(QUESTION, cls.dataset_path))
+        web.CACHE.delete(build_key(QUESTION, cls.dataset_path, user_id=cls.user_id))
         shutil.rmtree(cls.dataset_path, ignore_errors=True)
         dataio.clear_csv_cache()
 
@@ -160,7 +162,8 @@ class WebIntegrationTest(unittest.TestCase):
         return model
 
     def _key(self) -> str:
-        return build_key(QUESTION, self.dataset_path)
+        # 缓存 key 现在含用户维度：必须用当前登录用户去算，否则删不到/查不到自己的键
+        return build_key(QUESTION, self.dataset_path, user_id=self.user_id)
 
     def _counter(self, name: str) -> int:
         snap = metrics.snapshot()
@@ -262,6 +265,11 @@ class WebIntegrationTest(unittest.TestCase):
         web.CACHE.delete(self._key())
         self._use_model(FakeModel())
         r = self.client.post("/analyze_async", json=self._payload(), headers=self.headers)
+        if os.getenv("USE_POSTGRES", "").lower() != "true":
+            # 没有持久化检查点时必须明确拒绝：否则用户会拿到一个永远 confirm 不了的 job
+            self.assertEqual(r.status_code, 503, r.text)
+            self.assertIn("USE_POSTGRES", r.text)
+            return
         self.assertEqual(r.status_code, 200, r.text)
         submitted = r.json()
         self.assertEqual(submitted["status"], "queued")

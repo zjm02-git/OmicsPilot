@@ -99,14 +99,27 @@ def save_history(user_id,thread_id,user_request,status,final_report=""):
 
 
 # ============ 第 10 块：更新历史报告（改，按 thread_id 定位）============
-def update_history_report(thread_id,final_report):
+def update_history_report(thread_id,final_report,user_id=None):
     with Session(engine) as session:#（定位到「那一次分析」）
-        h=session.query(AnalysisHistory).filter(AnalysisHistory.thread_id==thread_id).first()
+        q=session.query(AnalysisHistory).filter(AnalysisHistory.thread_id==thread_id)
+        # user_id 不为 None 时把归属一起作为条件：否则任何人拿到别人的 thread_id
+        # 就能把别人的历史行改成 done + 塞进自己的报告
+        if user_id is not None:
+            q=q.filter(AnalysisHistory.user_id==user_id)
+        h=q.first()
         if h:
             h.final_report=final_report
             h.status="done"
             session.commit()
         return h
+
+
+# ============ 第 10.5 块：查某次分析的归属（给 /confirm 做资源级鉴权）============
+def history_owner_id(thread_id):
+    """返回这条 thread_id 属于哪个 user_id；没有这条记录返回 None。"""
+    with Session(engine) as session:
+        row=session.query(AnalysisHistory).filter(AnalysisHistory.thread_id==thread_id).first()
+        return None if row is None else row.user_id
 
 
 # ============ 第 11 块：查某用户的历史（查，倒序）============

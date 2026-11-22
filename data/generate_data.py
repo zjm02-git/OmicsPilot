@@ -10,13 +10,14 @@
 以后换成 TCGA / GEO 等真实公开数据，格式不用改，直接替换文件即可。
 """
 
+import math
 import os
 
 import numpy as np
 import pandas as pd
 
 N_GENES = 100        # 基因数
-N_PER_GROUP = 4      # 每组样本数
+N_PER_GROUP = 20     # 每组样本数（load_qc 要求每组 ≥20，4 个样本会被质检直接拒）
 UP_GENES = range(0, 20)     # 前 20 个基因：treatment 组上调
 DOWN_GENES = range(20, 30)  # 第 20~29 个：treatment 组下调
 
@@ -29,7 +30,8 @@ def main():
     treat = [f"treat_{i + 1}" for i in range(N_PER_GROUP)]
     samples = ctrl + treat
 
-    # 每个基因的基础表达量（服从正态分布）
+    # 值空间约定：和 fetch_tcga.py 一样，写出的是 log2(表达量+1)，不是线性值。
+    # 全流程只认这一种量纲，diff.py 才能直接做 mean_b - mean_a 得到 log2FC。
     base = rng.normal(8.0, 1.0, N_GENES)
 
     # 造表达矩阵：基线 + 随机噪声
@@ -37,12 +39,13 @@ def main():
     for s in samples:
         expr[s] = base + rng.normal(0, 0.5, N_GENES)
 
-    # 人为制造差异：让部分基因在 treatment 组表达量翻 3 倍 / 降到 1/3
-    # （这样 log2FC ≈ ±1.58，超过默认阈值 1.0，能被判为显著差异）
+    # 人为制造差异：log2 空间里加减 log2(3)≈1.585，等价线性空间的 3 倍 / 1/3，
+    # 正好越过默认阈值 |log2FC| > 1。
+    _fold = math.log2(3.0)
     for i in UP_GENES:
-        expr.loc[i, treat] = expr.loc[i, treat] * 3.0
+        expr.loc[i, treat] = expr.loc[i, treat] + _fold
     for i in DOWN_GENES:
-        expr.loc[i, treat] = expr.loc[i, treat] / 3.0
+        expr.loc[i, treat] = expr.loc[i, treat] - _fold
 
     here = os.path.dirname(os.path.abspath(__file__))
     expr.to_csv(os.path.join(here, "expression.csv"), index=False)

@@ -139,6 +139,20 @@ class BuildKeyTest(unittest.TestCase):
             k2 = cache.build_key("帮我做差异分析", d2)
             self.assertNotEqual(k1, k2)
 
+    def test_different_user_different_key(self):
+        """核心回归：同一句需求 + 同一份数据，不同用户必须产出不同的 key。
+
+        报告内容依赖该用户自己的阈值偏好（长期记忆 Store）；key 不带用户维度时，
+        B 用户会直接拿到 A 用户阈值算出来的报告（原缺陷，修复于 build_key 增加 user_id）。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "expr.csv"), "w", encoding="utf-8") as f:
+                f.write("gene,a,b\ng1,1,2\n")
+            k_a = cache.build_key("帮我做差异分析", d, user_id=1)
+            k_b = cache.build_key("帮我做差异分析", d, user_id=2)
+            self.assertNotEqual(k_a, k_b)
+            self.assertEqual(k_a, cache.build_key("帮我做差异分析", d, user_id=1))
+
     def test_missing_dataset_does_not_crash(self):
         key = cache.build_key("x", os.path.join(tempfile.gettempdir(), "definitely-not-here"))
         self.assertTrue(key.startswith("report:v3:"), key)

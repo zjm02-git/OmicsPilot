@@ -28,6 +28,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # ============ 第 1 块：导入库 + 创建应用 ============
+import logging
 import shutil
 import time
 import uuid
@@ -46,6 +47,7 @@ from db import (
     delete_user,
     get_history_by_user,
     get_user_by_username,
+    history_owner_id,
     save_history,
     update_history_report,
     update_password,
@@ -54,6 +56,19 @@ from omics_agent import jobs as jobs_mod
 from omics_agent import metrics
 from omics_agent.cache import ReportCache, build_key
 from omics_agent.graph import build_graph
+
+LOGGER = logging.getLogger("omics.web")
+
+
+def _async_jobs_available() -> bool:
+    """异步任务是否可用。
+
+    异步任务会把图跑到 **worker 进程**里，跑到 interrupt 挂起时，检查点只存在
+    那台 worker 的 checkpointer 上；/confirm 打到 backend 进程，必须有共享的
+    持久化检查点才取得到这个会话。InMemorySaver 下这条路是断的，必须往前拒，
+    而不是让用户拿到一个永远确认不了的 job。
+    """
+    return os.getenv("USE_POSTGRES", "").lower() == "true"
 
 app = FastAPI(title="多组学数据分析智能体", version="2.0")
 
@@ -83,7 +98,8 @@ if redis_client is not None:
 JOBS = jobs_mod.JobRegistry(
     redis_client=_queue_redis,
     ttl=int(os.getenv("JOB_TTL_S", "3600")),
-    visible_timeout_s=float(os.getenv("JOB_VISIBLE_TIMEOUT_S", "60")),
+    # 必须大于单步 LLM 超时（resilience 默认 90s）：否则任务还在跑就被判超时
+    visible_timeout_s=float(os.getenv("JOB_VISIBLE_TIMEOUT_S", "180")),
     max_retries=int(os.getenv("JOB_MAX_RETRIES", "3")),
 )
 
@@ -95,7 +111,8 @@ if not SECRET_KEY:
     SECRET_KEY = uuid.uuid4().hex
     print("[warn] 未配置 SECRET_KEY，已生成进程级临时密钥；重启后 token 将失效")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 60
+# 单位是分钟：默认 1440 = 24 小时。（原值 60*60 是 3600 分钟 = 60 小时，名实不符）
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
 
 # 数据集根目录：dataset_path 必须落在它下面（防路径穿越）
 ALLOWED_DATA_ROOT = os.path.abspath(os.path.join(BASE_DIR, "data"))
@@ -274,7 +291,9 @@ def upload_files(files: List[UploadFile] = File(), user: dict = Depends(get_curr
     if len(files) > UPLOAD_MAX_FILES:
         raise HTTPException(status_code=400, detail=f"一次最多上传 {UPLOAD_MAX_FILES} 个文件")
 
-    task_dir = os.path.join("data", "upload", str(uuid.uuid4()))
+    # 必须用 ALLOWED_DATA_ROOT 拼绝对路径：相对 CWD 落盘时，
+    # 换一个工作目录启动就会"上传成功但分析一律 400（不在 data/ 内）"
+    task_dir = os.path.join(ALLOWED_DATA_ROOT, "upload", str(uuid.uuid4()))
     os.makedirs(task_dir, exist_ok=True)
 
     try:
@@ -346,7 +365,9 @@ def _run_graph(asg: AnalizeRequest, dataset_path: str, history_user_id: int, cac
     initial = {
         "user_request": asg.user_request,
         "dataset_path": dataset_path,
-        "user_id": asg.user_id,  # 长期记忆按"研究者标识"分桶，允许任意字符串
+        # 归属只认 JWT 解出来的 user_id：请求体里的 user_id 任何登录用户都能伪造，
+        # 用它分桶等于允许别人读写你的长期记忆。
+        "user_id": str(history_user_id),
     }
 
     jobs_mod.progress("质检 + 人工确认")
@@ -386,8 +407,23 @@ def _run_graph(asg: AnalizeRequest, dataset_path: str, history_user_id: int, cac
     return body
 
 
+# 与 db.py 的列宽对齐：超长会被 MySQL 严格模式拒绝，整条历史静默消失（连 pending 行都没有）
+HISTORY_MAX_REQUEST = 500
+HISTORY_MAX_REPORT = 10000
+
+
 def _safe_save_history(**kwargs) -> None:
     """历史写库失败不能吞掉用户的报告：算都已经算完了，报告必须能拿走。"""
+    req = kwargs.get("user_request")
+    if isinstance(req, str) and len(req) > HISTORY_MAX_REQUEST:
+        LOGGER.warning("user_request 超长已截断 len=%d", len(req))
+        metrics.incr("history_truncated_request_total")
+        kwargs["user_request"] = req[:HISTORY_MAX_REQUEST]
+    rep = kwargs.get("final_report")
+    if isinstance(rep, str) and len(rep) > HISTORY_MAX_REPORT:
+        LOGGER.warning("final_report 超长已截断 len=%d", len(rep))
+        metrics.incr("history_truncated_report_total")
+        kwargs["final_report"] = rep[:HISTORY_MAX_REPORT]
     try:
         save_history(**kwargs)
     except Exception:  # noqa: BLE001
@@ -436,7 +472,7 @@ def _pop_pending(thread_id: str) -> str | None:
 def _core_analyze(asg: AnalizeRequest, history_user_id: int) -> dict:
     """缓存命中 → 直接返回；未命中 → 抢计算权，抢不到就等别人的结果。"""
     dataset_path = _validate_dataset_path(asg.dataset_path)
-    key = build_key(asg.user_request, dataset_path)
+    key = build_key(asg.user_request, dataset_path, user_id=history_user_id)
 
     if not asg.use_cache:
         metrics.incr("cache_bypass_total")
@@ -492,6 +528,13 @@ def analyze(asg: AnalizeRequest, user: dict = Depends(get_current_user)):
 @app.post("/confirm")
 def confirm(req: ConfirmRequest, user: dict = Depends(get_current_user)):
     """人工确认后续跑（HITL 第二段）。"""
+    # 资源级鉴权：thread_id 在历史表里属于谁，就只能谁确认。
+    # 没有这条记录 = 不是这个用户的会话（或会话已过期），同样按不存在处理。
+    owner_id = history_owner_id(req.thread_id)
+    if owner_id is None or str(owner_id) != str(user["user_id"]):
+        metrics.incr("confirm_access_denied_total")
+        raise HTTPException(status_code=404, detail="会话不存在或已失效")
+
     config = {"configurable": {"thread_id": req.thread_id}}
     try:
         with metrics.timer("graph.phase2_ms"):
@@ -511,7 +554,9 @@ def confirm(req: ConfirmRequest, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=409, detail="该分析仍在等待人工确认，请重试或取消")
 
     final_report = result.get("final_report") or ""
-    update_history_report(thread_id=req.thread_id, final_report=final_report)
+    update_history_report(
+        thread_id=req.thread_id, final_report=final_report, user_id=user["user_id"]
+    )
 
     # 回填缓存：这条路径的报告在 confirm 才生成，不回填的话"同一问题第二次提交"
     # 永远不会命中缓存（差异分析主路径就是这样漏掉的）。
@@ -537,8 +582,21 @@ def confirm(req: ConfirmRequest, user: dict = Depends(get_current_user)):
 @app.post("/analyze_async")
 def analyze_async(asg: AnalizeRequest, user: dict = Depends(get_current_user)):
     """提交长任务：写状态 + 入 Redis Stream 队列，立刻返回 job_id，前端轮询 /jobs/{id}。"""
+    if not _async_jobs_available():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "异步分析需要持久化检查点：请设置 USE_POSTGRES=true 并启动 Postgres。"
+                "（图会在 worker 进程中断等待人工确认，进程内检查点在 /confirm 时取不到；"
+                "不开启时请改用同步的 /analyze）"
+            ),
+        )
     try:
-        job_id = JOBS.submit("analyze", {"asg": asg.model_dump(), "user_id": user["user_id"]})
+        job_id = JOBS.submit(
+            "analyze",
+            {"asg": asg.model_dump(), "user_id": user["user_id"]},
+            owner=user["user_id"],
+        )
     except Exception as exc:  # noqa: BLE001 - Redis 不可用时队列不可用
         raise HTTPException(status_code=503, detail=f"任务队列不可用：{exc}") from exc
     return {"job_id": job_id, "status": "queued"}
@@ -548,6 +606,11 @@ def analyze_async(asg: AnalizeRequest, user: dict = Depends(get_current_user)):
 def get_job(job_id: str, user: dict = Depends(get_current_user)):
     job = JOBS.get(job_id)
     if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    # 资源级鉴权：job 里没有归属信息或归属不是当前用户，一律当"不存在"处理
+    # （用 404 而不是 403，避免把"这个 job_id 真的存在"这个信息泄露出去）
+    if str(job.get("user_id")) != str(user["user_id"]):
+        metrics.incr("job_access_denied_total")
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
     return job
 
@@ -589,20 +652,37 @@ def healthz():
     Redis 不可用算 degraded 而不是 down —— 缓存层会自动降级到进程内，业务仍可用；
     MySQL 不可用则鉴权/历史全废，直接 503，让编排系统摘流量。
     """
+    # 探活接口自己绝不能因为依赖挂了而 500：那会让编排系统分不清
+    # "服务挂了" 和 "依赖挂了"，而后者恰恰是最需要它给出答案的时候。
+    def _probe(fn, default=False):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("healthz probe failed: %s", exc)
+            return default
+
+    def _safe(fn, default):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("healthz section failed: %s", exc)
+            return default
+
     checks = {
-        "redis": CACHE.ping(),
-        "mysql": _check_mysql(),
+        "redis": _probe(CACHE.ping, False),
+        "mysql": _probe(_check_mysql, False),
         "graph_checkpointer": "postgres" if os.getenv("USE_POSTGRES", "").lower() == "true" else "memory",
         "llm_key_configured": bool(os.getenv("DEEPSEEK_API_KEY")),
+        "async_jobs_available": _async_jobs_available(),
     }
-    critical_ok = checks["mysql"]
+    critical_ok = bool(checks["mysql"])
     status = "ok" if critical_ok and checks["redis"] else ("degraded" if critical_ok else "down")
     body = {
         "status": status,
         "checks": checks,
-        "cache": CACHE.stats(),
-        "jobs": JOBS.stats(),
-        "uptime_s": metrics.snapshot()["uptime_s"],
+        "cache": _safe(CACHE.stats, {}),
+        "jobs": _safe(JOBS.stats, {"available": False}),
+        "uptime_s": _safe(lambda: metrics.snapshot()["uptime_s"], None),
     }
     return JSONResponse(status_code=200 if critical_ok else 503, content=body)
 

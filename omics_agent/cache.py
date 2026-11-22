@@ -219,13 +219,23 @@ class ReportCache:
         }
 
 
-def build_key(user_request: str, dataset_path: str, version: str = "v3") -> str:
-    """缓存 key = 版本 + 归一化问题 + 数据集绝对路径 + 数据集指纹。
+def build_key(
+    user_request: str,
+    dataset_path: str,
+    version: str = "v3",
+    user_id: str | int | None = None,
+) -> str:
+    """缓存 key = 版本 + 归属用户 + 归一化问题 + 数据集绝对路径 + 数据集指纹。
 
     指纹（文件名+字节数+mtime）保证"换数据不串报告"；路径入 key 允许同一份
     数据被上传到两个目录时各自独立缓存，避免跨任务误命中。
+
+    **user_id 必须入 key**：报告内容依赖该用户自己的阈值偏好（长期记忆 Store），
+    不带 user 维度时，B 用户问同一个问题会直接拿到 A 用户阈值算出来的报告。
+    这也是"缓存串数据"那个缺陷在用户维度上的同一个洞。
     """
     fingerprint = dataset_fingerprint(dataset_path)
     normalized = " ".join((user_request or "").split())
-    raw = f"{version}|{normalized}|{os.path.abspath(dataset_path)}|{fingerprint}"
+    owner = "anonymous" if user_id is None else str(user_id)
+    raw = f"{version}|{owner}|{normalized}|{os.path.abspath(dataset_path)}|{fingerprint}"
     return "report:" + version + ":" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]

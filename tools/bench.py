@@ -71,7 +71,7 @@ def token_headers():
 
 
 def bench_cache_hit(concurrency=32, total=512):
-    key = cache_mod.build_key(QUESTION, "data")
+    key = cache_mod.build_key(QUESTION, "data", user_id=1)  # token 是 create_token(1, "bench")
     web.CACHE.set(key, REPORT, ttl=3600)
     headers = token_headers()
     body = {"user_request": QUESTION, "dataset_path": "data", "user_id": "bench"}
@@ -131,7 +131,7 @@ def bench_cache_hit(concurrency=32, total=512):
 def bench_cold_path(runs=3):
     """冷路径真耗时：每次先清掉缓存 key，否则测到的是上一轮留下的命中结果。"""
     headers = token_headers()
-    key = cache_mod.build_key(QUESTION, "data")
+    key = cache_mod.build_key(QUESTION, "data", user_id=1)  # token 是 create_token(1, "bench")
     out = []
     with httpx.Client(timeout=180) as client:
         for i in range(runs):
@@ -177,7 +177,7 @@ class BrokenRedis:
 
 def bench_redis_down():
     """Redis 整体不可用：服务不能 500，必须降级到进程内缓存并继续返回报告。"""
-    key = cache_mod.build_key(QUESTION + "（redis 故障注入）", "data")
+    key = cache_mod.build_key(QUESTION + "（redis 故障注入）", "data", user_id=1)
     original = web.CACHE
     web.CACHE = cache_mod.ReportCache(redis_client=BrokenRedis(), connect=False)
     try:

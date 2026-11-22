@@ -66,6 +66,8 @@ def enrichment_analysis(
     annotation_df: pd.DataFrame,
     background_genes: list,
     fdr_threshold: float = 0.05,
+    min_term_size: int = 5,
+    max_term_size: int = 500,
 ) -> pd.DataFrame:
     """对一组显著基因做通路富集，返回每个通路的检验结果。
 
@@ -74,6 +76,8 @@ def enrichment_analysis(
         annotation_df:    注释表，至少两列 gene / term（一个基因可属于多个通路）
         background_genes: 背景基因全集（通常 = 表达矩阵里的所有基因）
         fdr_threshold:    FDR 阈值，默认 < 0.05
+        min_term_size:    基因集最小规模，默认 5（更小的注释多半是噪声）
+        max_term_size:    基因集最大规模，默认 500（更大的泛类目会稳定占据 top 榜）
 
     返回:
         DataFrame，每行一个通路：term / bg_count / sig_count /
@@ -95,10 +99,14 @@ def enrichment_analysis(
     rows = []
     for term, genes_in_term in term_to_genes.items():
         K = len(genes_in_term)
+        # 基因集规模过滤：K 太小（1~4）的注释基本是噪声，K 太大的泛类目
+        # （细胞通讯、跨膜运输这种）几乎必然命中，会把 top 榜占满而没有信息量。
+        if K < min_term_size or K > max_term_size:
+            continue
         k = len(genes_in_term & sig_set)
-        if K == 0 or k == 0:
-            continue  # 该通路在显著基因里一个都没有，谈不上富集
-        pvalue = _hypergeom_upper_pvalue(N, K, n, k)
+        # k==0 的通路 p 值必然是 1，但**必须留在多重检验的 m 里**：
+        # 提前 continue 会让 m 变小、所有报出来的 FDR 系统性偏小（anti-conservative）。
+        pvalue = 1.0 if k == 0 else _hypergeom_upper_pvalue(N, K, n, k)
         rows.append({
             "term": term,
             "bg_count": K,

@@ -23,6 +23,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 TARGETS = [
+    os.path.join(ROOT, "omics_agent", "diff.py"),
+    os.path.join(ROOT, "omics_agent", "enrichment.py"),
     os.path.join(ROOT, "omics_agent", "cache.py"),
     os.path.join(ROOT, "omics_agent", "context.py"),
     os.path.join(ROOT, "omics_agent", "dataio.py"),

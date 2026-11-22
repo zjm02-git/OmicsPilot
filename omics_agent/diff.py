@@ -65,6 +65,7 @@ def differential_expression(
     group_b: str,
     fc_threshold: float = 1.0,
     fdr_threshold: float = 0.05,
+    input_scale: str = "log2",
 ) -> pd.DataFrame:
     """对每个基因做两组差异表达分析。
 
@@ -76,9 +77,11 @@ def differential_expression(
         group_b:     B 组名
         fc_threshold:  log2FC 阈值，默认 |log2FC| > 1（即差 2 倍）
         fdr_threshold: FDR 阈值，默认 < 0.05
+        input_scale:  表达矩阵的值空间："log2"（默认，如 log2(FPKM+1)）或 "linear"
 
     返回:
-        DataFrame，每行一个基因，含 mean/log2fc/pvalue/fdr/significant
+        DataFrame，每行一个基因，含 mean/log2fc/pvalue/fdr/significant。
+        log2fc 的方向约定为 **B 相对 A**：正值 = 该基因在 group_b 中更高。
     """
     # 1. 从 metadata 取出两组各自的样本名
     meta = metadata_df.set_index("sample_id")
@@ -99,8 +102,14 @@ def differential_expression(
     mean_a = mat_a.mean(axis=1) # 每个基因在 A 组的平均表达
     mean_b = mat_b.mean(axis=1)
 
-    # log2 fold change（+1e-6 防 log0）
-    log2fc = np.log2((mean_b + 1e-6) / (mean_a + 1e-6))# 倍数变化取 log2
+    # log2 fold change，方向是 B 相对 A（正数 = 在 group_b 中更高）。
+    # 值空间必须先约定：TCGA 数据是 log2(FPKM+1)，已经在对数轴上，相减就是 log2FC；
+    # 只有线性量纲才用 log2(比值)。对 log2 数据再取 log2(比值) 是双重取对数，
+    # 结果没有倍数语义，且依赖 log 的平移量——同一个基因换个伪计数就会变成另一个数。
+    if input_scale == "linear":
+        log2fc = np.log2((mean_b + 1.0) / (mean_a + 1.0))
+    else:
+        log2fc = mean_b - mean_a
 
     p_values = _p_values(mat_a, mat_b) # 每个基因的 p 值（下一步细讲）
 

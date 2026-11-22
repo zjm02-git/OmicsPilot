@@ -22,6 +22,9 @@ data/upload/
 # Obsidian 笔记配置
 docs/.obsidian/
 
+# 修复前的源码备份（只在本地保留，不入库）
+.p0_backup/
+
 # 临时/杂项文件
 *.base
 .gitignore.txt

@@ -26,6 +26,10 @@ from redis.exceptions import ResponseError
 
 from omics_agent import metrics
 
+# Stream 上限：XACK 只清 PEL、不删条目，不设上限 Redis 内存会随任务数单调增长，
+# 而 queue_len 也会永远只增不减（指标彻底失去意义）。
+DEFAULT_MAX_LEN = 10000
+
 STREAM = "omics:jobs"
 GROUP = "omics:workers"
 DEAD_STREAM = "omics:jobs:dead"
@@ -43,6 +47,7 @@ class StreamQueue:
         dead_stream: str = DEAD_STREAM,
         visible_timeout_s: float = 60.0,
         max_retries: int = 3,
+        max_len: int = DEFAULT_MAX_LEN,
     ) -> None:
         self.redis = redis_client
         self.stream = stream
@@ -50,6 +55,7 @@ class StreamQueue:
         self.dead_stream = dead_stream
         self.visible_timeout_ms = max(1000, int(visible_timeout_s * 1000))
         self.max_retries = max(0, int(max_retries))
+        self.max_len = max(100, int(max_len))
 
     def ensure_group(self) -> None:
         """幂等建消费组（已存在会抛 BUSYGROUP，忽略）。"""
@@ -63,6 +69,8 @@ class StreamQueue:
         return self.redis.xadd(
             self.stream,
             {"job_id": job_id, "type": task_type, "payload": json.dumps(payload), "retry": 0},
+            maxlen=self.max_len,
+            approximate=True,  # ~ 近似裁剪：Redis 按整节点删，比精确 XTRIM 便宜
         )
 
     def new_consumer(self) -> str:
@@ -86,7 +94,16 @@ class StreamQueue:
         return out
 
     def ack(self, msg_id: str) -> None:
+        """确认并删除条目。
+
+        XACK 只把消息从 PEL 摘掉，条目本身仍留在 stream 里 —— 不 XDEL 的话
+        每条任务（含用户原始请求 payload）都会永久留存，直到 Redis 被撑爆。
+        """
         self.redis.xack(self.stream, self.group, msg_id)
+        try:
+            self.redis.xdel(self.stream, msg_id)
+        except Exception:  # noqa: BLE001 - 删失败不影响正确性，靠 maxlen 兜底
+            pass
 
     def claim_stale(self, consumer: str, count: int = 100) -> list[tuple[str, dict]]:
         """XAUTOCLAIM：把「超过可见性超时还没确认」的消息抢到自己名下处理。"""
@@ -112,23 +129,37 @@ class StreamQueue:
             {"job_id": data["job_id"], "type": data["type"], "payload": data["payload"], "retry": retry},
         )
         self.redis.xack(self.stream, self.group, msg_id)
+        try:
+            self.redis.xdel(self.stream, msg_id)
+        except Exception:  # noqa: BLE001
+            pass
         metrics.incr("queue_retry_total")
 
     def dead_letter(self, msg_id: str, data: dict, error: str) -> None:
         """进死信：失败超上限，消息进独立 stream 留证据，确认原消息。"""
-        self.redis.xadd(self.dead_stream, {**data, "error": error})
+        self.redis.xadd(self.dead_stream, {**data, "error": error}, maxlen=self.max_len, approximate=True)
         self.redis.xack(self.stream, self.group, msg_id)
+        try:
+            self.redis.xdel(self.stream, msg_id)
+        except Exception:  # noqa: BLE001
+            pass
         metrics.incr("queue_dead_letter_total")
 
     def stats(self) -> dict[str, Any]:
-        """队列健康度：待消费 / PEL 未确认 / 死信。"""
+        """队列健康度：待消费 / PEL 未确认（=执行中）/ 死信。"""
+        if self.redis is None:
+            return {"queue_len": 0, "pending": 0, "dead_len": 0, "available": False}
         try:
             pending = self.redis.xpending(self.stream, self.group)
             pending_count = pending.get("pending", 0) if isinstance(pending, dict) else len(pending)
         except Exception:  # noqa: BLE001 - 组还没建时 xpending 报错
             pending_count = 0
-        return {
-            "queue_len": int(self.redis.xlen(self.stream) or 0),
-            "pending": pending_count,
-            "dead_len": int(self.redis.xlen(self.dead_stream) or 0),
-        }
+        try:
+            return {
+                "queue_len": int(self.redis.xlen(self.stream) or 0),
+                "pending": pending_count,
+                "dead_len": int(self.redis.xlen(self.dead_stream) or 0),
+                "available": True,
+            }
+        except Exception:  # noqa: BLE001 - Redis 中途掉线：探活不能把自己探成 500
+            return {"queue_len": 0, "pending": pending_count, "dead_len": 0, "available": False}

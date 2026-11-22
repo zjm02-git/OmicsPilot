@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import threading
 import time
 import uuid
 from typing import Any, Callable
@@ -68,6 +69,9 @@ class JobRegistry:
             max_retries=max_retries,
         )
         self.ttl = max(60, int(ttl))
+        # 心跳间隔取可见性超时的 1/3：连丢 2 次心跳才可能被误判为"worker 已死"
+        self.heartbeat_interval_s = max(2.0, self.queue.visible_timeout_ms / 1000.0 / 3.0)
+        self._consumer_name = "unknown"
         self._handlers: dict[str, Callable] = {}
 
     # ── 提交侧（web 用）────────────────────────────
@@ -75,25 +79,37 @@ class JobRegistry:
         """注册「任务类型 → 处理函数」。幂等：重复注册覆盖。"""
         self._handlers[task_type] = fn
 
-    def submit(self, task_type: str, payload: dict) -> str:
-        """提交任务：写状态（queued）+ 入队（XADD）。返回 job_id。"""
+    def submit(self, task_type: str, payload: dict, owner: Any = None) -> str:
+        """提交任务：写状态（queued）+ 入队（XADD）。返回 job_id。
+
+        owner 是任务归属（user_id）：/jobs/{id} 靠它做资源级鉴权，
+        不写的话任何登录用户拿到 job_id 就能读别人的完整报告。
+        """
         if self.redis is None:
             raise RuntimeError("任务队列依赖 Redis，但 Redis 当前不可用")
         job_id = uuid.uuid4().hex[:12]
-        self._set_job(job_id, {
+        fields = {
             "job_id": job_id,
             "type": task_type,
             "status": "queued",
             "stage": "排队中",
             "created_at": time.time(),
             "retry": 0,
-        })
+        }
+        if owner is not None:
+            fields["user_id"] = str(owner)
+        self._set_job(job_id, fields)
         self.queue.enqueue(job_id, task_type, payload)
         metrics.incr("job_submitted_total")
         return job_id
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        raw = self.redis.hgetall(JOB_KEY_PREFIX + job_id)
+        if self.redis is None:
+            return None
+        try:
+            raw = self.redis.hgetall(JOB_KEY_PREFIX + job_id)
+        except Exception:  # noqa: BLE001 - Redis 中途掉线：查任务失败不等于 500
+            return None
         if not raw:
             return None
         job = dict(raw)
@@ -112,16 +128,24 @@ class JobRegistry:
         return job
 
     def stats(self) -> dict[str, Any]:
+        if self.redis is None:
+            return {"jobs_total": 0, "by_status": {}, "queue": self.queue.stats(),
+                    "available": False}
         counts: dict[str, int] = {}
-        for key in self.redis.scan_iter(match=JOB_KEY_PREFIX + "*", count=100):
-            raw = self.redis.hgetall(key)
-            if raw:
-                st = raw.get("status", "unknown")
-                counts[st] = counts.get(st, 0) + 1
+        try:
+            for key in self.redis.scan_iter(match=JOB_KEY_PREFIX + "*", count=100):
+                raw = self.redis.hgetall(key)
+                if raw:
+                    st = raw.get("status", "unknown")
+                    counts[st] = counts.get(st, 0) + 1
+        except Exception:  # noqa: BLE001 - 探活接口不能因为依赖挂了就 500
+            return {"jobs_total": 0, "by_status": counts, "queue": self.queue.stats(),
+                    "available": False}
         return {
             "jobs_total": sum(counts.values()),
             "by_status": counts,
             "queue": self.queue.stats(),
+            "available": True,
         }
 
     # ── 内部：状态读写 ─────────────────────────────
@@ -136,7 +160,12 @@ class JobRegistry:
         """阻塞消费循环：先 XAUTOCLAIM 接走超时任务，再 XREADGROUP 读新任务。"""
         self.queue.ensure_group()
         consumer = consumer or self.queue.new_consumer()
-        print(f"[worker] 启动 consumer={consumer}，可见性超时={self.queue.visible_timeout_ms}ms", flush=True)
+        self._consumer_name = consumer
+        print(
+            f"[worker] 启动 consumer={consumer}，可见性超时={self.queue.visible_timeout_ms}ms，"
+            f"心跳间隔={self.heartbeat_interval_s}s",
+            flush=True,
+        )
         while True:
             # 1) 接管别人挂了没确认的任务（PEL 里超时的）
             for msg_id, data in self.queue.claim_stale(consumer):
@@ -155,9 +184,35 @@ class JobRegistry:
             metrics.incr("job_dedup_total")
             return
 
+        # 「PEL 里超时」只说明原 worker 没 XACK，不等于它死了：
+        # 单步 LLM 超时可能比可见性超时更长，光靠 XAUTOCLAIM 会把还在跑的任务抢走跑两遍
+        # （双倍 token、双份历史）。所以先看心跳，活着就不接。
+        if existing and existing.get("status") == "running":
+            try:
+                beat = float(existing.get("heartbeat_at") or 0.0)
+            except (TypeError, ValueError):
+                beat = 0.0
+            if time.time() - beat < self.queue.visible_timeout_ms / 1000.0:
+                # 注意：这里**不能 XACK**。确认掉就意味着"这条任务处理完了"，
+                # 万一原 worker 其实已经死了（心跳恰好在窗口内），任务就永久丢了。
+                # 留在 PEL 里即可：等它真死了，心跳过期后下一轮就会被正常接管。
+                metrics.incr("job_claim_rejected_total")
+                return
+
         started = time.time()
-        self._set_job(job_id, {"status": "running", "stage": "执行中", "started_at": started})
+        self._set_job(job_id, {
+            "status": "running",
+            "stage": "执行中",
+            "started_at": started,
+            "heartbeat_at": started,
+            "worker": self._consumer_name,
+        })
         token = _CURRENT_JOB.set({"job_id": job_id, "redis": self.redis})
+        stop_beat = threading.Event()
+        beat_thread = threading.Thread(
+            target=self._heartbeat, args=(job_id, stop_beat), daemon=True
+        )
+        beat_thread.start()
         try:
             result = self._dispatch(data["type"], json.loads(data["payload"]))
             # 不覆盖 stage：保留 progress() 最后上报的阶段文案
@@ -183,7 +238,16 @@ class JobRegistry:
                 self._set_job(job_id, {"status": "queued", "stage": "重试排队中", "retry": retry + 1})
                 metrics.incr("job_retry_total")
         finally:
+            stop_beat.set()
             _CURRENT_JOB.reset(token)
+
+    def _heartbeat(self, job_id: str, stop: threading.Event) -> None:
+        """执行期间定期续命：让别的 worker 知道这个任务还活着，别接管。"""
+        while not stop.wait(self.heartbeat_interval_s):
+            try:
+                self.redis.hset(JOB_KEY_PREFIX + job_id, mapping={"heartbeat_at": time.time()})
+            except Exception:  # noqa: BLE001 - 心跳失败不中断业务，最坏是被接管
+                return
 
     def _dispatch(self, task_type: str, payload: dict) -> Any:
         handler = self._handlers.get(task_type)
