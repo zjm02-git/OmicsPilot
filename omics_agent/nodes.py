@@ -29,7 +29,7 @@ from omics_agent.context import drop_note, fit_blocks
 from omics_agent.dataio import read_csv_cached
 from omics_agent.diff import differential_expression
 from omics_agent.enrichment import enrichment_analysis
-from omics_agent.rag import get_gene_function, retrieve_genes
+from omics_agent.rag import get_gene_function, retrieve_hybrid
 # 一次 import 两个：get_gene_function 精确查名、retrieve_genes 语义检索
 from omics_agent.resilience import (
     CircuitBreaker,
@@ -627,7 +627,7 @@ def qa_node(state: dict) -> dict:
     hits: list = []
     try:
         with metrics.timer("rag.retrieve_ms"):
-            hits = retrieve_genes(question, top_k=5)  # 语义检索，返回最像的 5 个基因
+            hits = retrieve_hybrid(question, top_k=5)  # 混合检索（向量+BM25+RRF），返回最相关的 5 个基因
         metrics.incr("qa_retrieval_total")
     except Exception as exc:  # noqa: BLE001 - 向量库/embedding 服务挂了不能让问答直接 500
         metrics.incr("qa_retrieval_error_total")
@@ -645,7 +645,7 @@ def qa_node(state: dict) -> dict:
     for idx, (_, doc, score) in enumerate(hits):
         blocks.append({
             "name": f"卡片{idx + 1}",
-            "text": f"- {doc[:800]}（相似度 {score:.2f}）",
+            "text": f"- {doc[:800]}（相关度 {score:.2f}）",
             "priority": 10.0 - float(idx),  # 保持检索顺序，前面的更相关
         })
     texts, info = fit_blocks(blocks, QA_TOKEN_BUDGET)

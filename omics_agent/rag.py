@@ -30,6 +30,8 @@ import pandas as pd  #表格处理库；读 csv、操作「带列名的表」
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from omics_agent.bm25 import BM25  # 稀疏检索（字面匹配），和向量检索互补
+
 # ── 第 1 块：定位项目根目录，拼数据路径 ─────────────────
 # __file__        = 当前这个文件的完整路径
 # os.path.abspath = 把路径变成绝对路径（去掉可能有的 ..）
@@ -54,6 +56,7 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 _vecs = None      # 向量矩阵；None = 还没读
 _cards = None     # 基因卡片表；None = 还没读
 _embedder = None  # embedding 客户端；None = 还没建
+_bm25 = None      # BM25 索引；None = 还没建（惰性加载）
 
 
 # ================= 第 3 块：_load 开箱 =================
@@ -139,6 +142,61 @@ def retrieve_genes(question: str, top_k: int = 5):
         # scores[idx] = 这个基因的相似度分数
 
     return results # 返回整个列表
+
+
+# ================= 第 4.5 块：混合检索（向量 + BM25 + RRF）=================
+def _vector_ranks(question: str):
+    """把问题算成向量，返回「按相似度从高到低」的 (doc_id, 相似度) 全量列表。
+
+    和上面的 retrieve_genes 是同一套 embedding 逻辑，抽出来供混合检索复用；
+    两处保持一致（模型名、归一化、点积）。
+    """
+    vecs, _, embedder = _load()
+    r = embedder.embeddings.create(model="BAAI/bge-m3", input=question)
+    q = np.array(r.data[0].embedding, dtype=np.float32)
+    q = q / np.linalg.norm(q)
+    vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+    scores = vecs @ q
+    order = np.argsort(-scores)  # 相似度从高到低的下标
+    return [(int(i), float(scores[i])) for i in order]
+
+
+def _get_bm25():
+    """惰性建 BM25 索引（在卡片 description 上建倒排表），只建一次。"""
+    global _bm25
+    if _bm25 is None:
+        _, cards, _ = _load()
+        _bm25 = BM25(cards["description"].astype(str).tolist())
+    return _bm25
+
+
+def retrieve_hybrid(question: str, top_k: int = 5, rrf_k: int = 60):
+    """混合检索：向量 + BM25 两路各自排名，用 RRF 融合后取前 top_k。
+
+    为什么 RRF（Reciprocal Rank Fusion）：
+      向量分数是余弦相似度（约 0~1），BM25 分数是无上界的加权词频，两把尺子
+      不能直接相加。RRF 只看「排名」不看绝对分——每个基因在每路里的名次
+      换算成 1/(rrf_k + 名次) 再累加，跨尺度也能公平融合。
+
+    返回：[(基因名, 原文, RRF 分数), ...]，形状和 retrieve_genes 一致。
+    """
+    _, cards, _ = _load()
+
+    # ① 向量这一路的排名（全量）
+    vec_ranked = _vector_ranks(question)  # [(doc_id, 相似度), ...] 已按相似度降序
+
+    # ② BM25 这一路的排名（只返回命中了查询词的文档）
+    bm25_ranked = _get_bm25().search(question, top_k=len(cards))  # [(doc_id, bm25分), ...]
+
+    # ③ RRF 融合：名次从 1 起，只在某一路出现过的文档只累加该路的分
+    rrf = {}
+    for rank, (doc_id, _) in enumerate(vec_ranked):
+        rrf[doc_id] = rrf.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+    for rank, (doc_id, _) in enumerate(bm25_ranked):
+        rrf[doc_id] = rrf.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+
+    order = sorted(rrf, key=lambda d: rrf[d], reverse=True)[:top_k]
+    return [(cards.iloc[d]["gene"], cards.iloc[d]["description"], rrf[d]) for d in order]
 
 
 def get_gene_function(gene: str):
