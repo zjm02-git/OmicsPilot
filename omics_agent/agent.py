@@ -16,16 +16,30 @@
   - tools 节点：真正执行工具，把结果作为 ToolMessage 塞回对话；
   - 条件边 should_continue：模型还想调工具 → 回 tools；否则 → END。
 
-目前有 9 个工具（5 个分析/检索 + 2 个 Skill 技能库 + 2 个 MCP 数据库）：
-  query_gene          基因知识问答（先精确查名，再语义检索）
-  run_differential    差异表达分析（找显著上/下调基因）
-  run_pca             主成分分析（看样本分布）
-  run_clustering      KMeans 聚类（看样本分几群）
-  search_literature   检索 PubMed 文献（联网，拿标题+摘要）
-  list_skills         列出可用的技能（Skill）清单
-  load_skill          加载某个技能的完整说明（SKILL.md 正文）
-  mcp_get_user_count  统计注册用户数（MCP 协议连数据库 server）
-  mcp_get_history     查某用户最近分析历史（MCP 协议连数据库 server）
+「跑飞」防护（面试必问「你的 Agent 死循环怎么办」，答案就在这几层）：
+  1. max_steps：工具轮数预算，用尽后拿掉工具、强制模型「用已有信息作答」；
+  2. 重复调用检测：(工具名, 参数) 指纹去重，原地打转的调用不再真的执行；
+  3. 单工具超时：某个工具卡住只放弃这一次等待，不拖死整个请求；
+  4. GraphRecursionError：框架级最后一道防线，兜成可读的降级回答。
+  参数默认值集中在下面「ReAct 护栏参数」一节，可用环境变量覆盖。
+
+长期记忆（Store）：
+  编译图时挂上 store，ReAct 侧因此有了 recall_preferences / save_preference
+  两个工具，和固定图（nodes.py 的 save_memory_node）共用同一个命名空间，
+  所以「ReAct 里记住的阈值偏好」固定图那边读得到，反之亦然。
+
+目前有 11 个工具（5 个分析/检索 + 2 个 Skill 技能库 + 2 个长期记忆 + 2 个 MCP 数据库）：
+  query_gene            基因知识问答（先精确查名，再语义检索）
+  run_differential      差异表达分析（找显著上/下调基因）
+  run_pca               主成分分析（看样本分布）
+  run_clustering        KMeans 聚类（看样本分几群）
+  search_literature     检索 PubMed 文献（联网，拿标题+摘要）
+  list_skills           列出可用的技能（Skill）清单
+  load_skill            加载某个技能的完整说明（SKILL.md 正文）
+  recall_preferences    读某位研究者长期记忆里的分析偏好
+  save_preference       把一条分析偏好写进长期记忆
+  mcp_get_user_count    统计注册用户数（MCP 协议连数据库 server）
+  mcp_get_history       查某用户最近分析历史（MCP 协议连数据库 server）
 
 用法（项目根目录）：
     python -B omics_agent/agent.py                       # 默认跑一个组合问题
@@ -43,19 +57,28 @@ import json  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 import xml.etree.ElementTree as ET  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
+from concurrent.futures import TimeoutError as FutureTimeout  # noqa: E402
 
 import numpy as np  # noqa: E402
-from langchain_core.messages import HumanMessage  # noqa: E402
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: E402
 from langchain_core.tools import tool  # noqa: E402
+from langgraph.errors import GraphRecursionError  # noqa: E402
 from langgraph.graph import END, START, MessagesState, StateGraph  # noqa: E402
-from langgraph.prebuilt import ToolNode  # noqa: E402
 
-from omics_agent.config import get_checkpointer, get_model  # noqa: E402
+from omics_agent.config import get_checkpointer, get_model, get_store  # noqa: E402
 from omics_agent.dataio import read_csv_cached  # noqa: E402
 from omics_agent.diff import differential_expression  # noqa: E402
-from omics_agent.nodes import DATASET_PATH, discover_dataset  # noqa: E402
-from omics_agent.rag import get_gene_function, retrieve_genes  # noqa: E402
 from omics_agent.mcp_client import MCP_TOOLS  # noqa: E402
+# MEMORY_NS / PREFS_KEY 直接从固定图那边引进来：长期记忆只有一个命名空间，
+# 两边各写一份常量迟早会漂移，读到的偏好就对不上了。
+from omics_agent.nodes import (  # noqa: E402
+    DATASET_PATH,
+    MEMORY_NS,
+    PREFS_KEY,
+    discover_dataset,
+)
+from omics_agent.rag import get_gene_function, retrieve_genes  # noqa: E402
 from omics_agent.resilience import call_with_retry  # noqa: E402
 
 # 抽「疑似基因名」的正则（和 nodes.py 里的一样）：BRCA1、TP53 这类
@@ -256,38 +279,316 @@ def load_skill(name: str) -> str:
         return f.read()
 
 
+# ══════════ 长期记忆（Store）：让 ReAct 侧也能读写「研究者偏好」══════════
+# 命名空间/键直接用 nodes.py 里的 MEMORY_NS / PREFS_KEY：
+# 固定图存的是 (MEMORY_NS + user_id, PREFS_KEY) → {fc_threshold, fdr_threshold, ...}，
+# ReAct 这里读写的完全是同一个槽位，两条入口共享一份长期记忆。
+
+# 合法字段 → 类型。写回时按这个表做类型纠正，保证 ReAct 写进去的形状
+# 和固定图 save_memory_node 写进去的形状一致（否则固定图读到 str 阈值会炸）。
+PREF_FIELDS = {
+    "fc_threshold": float,
+    "fdr_threshold": float,
+    "group_a": str,
+    "group_b": str,
+}
+
+# build_agent_graph 编译时把 store 实例记在这里，供「不在图里执行」的场景兜底
+_STORE = None
+
+
+def _memory_store():
+    """取长期记忆 Store（优先拿运行期注入的那个实例）。
+
+    为什么要有这个函数：
+      图里的节点拿 store 很方便（runtime.store），但工具函数是普通函数，
+      没有 runtime 参数。LangGraph 的约定是：compile(store=...) 之后，
+      节点内执行时可以用 langgraph.config.get_store() 拿到同一个实例。
+      老版本没有这个 API、或者单独 import 工具做单测时拿不到，就退回
+      模块里缓存的那个实例——两条路都指向「同一份记忆」，不会出现
+      「写进去了但读不到」的假象。
+    """
+    global _STORE
+    try:
+        from langgraph.config import get_store as _lg_get_store
+
+        injected = _lg_get_store()
+        if injected is not None:
+            return injected
+    except Exception:  # noqa: BLE001 - API 不存在/不在图上下文里，退回单例
+        pass
+    if _STORE is None:
+        _STORE = get_store()   # config.get_store()：内存版或 PostgresStore
+    return _STORE
+
+
+def _coerce_pref(key: str, value):
+    """把用户/模型给的值转成该字段原本的类型（阈值存成 str 会让下游比较报错）。"""
+    want = PREF_FIELDS[key]
+    if want is float:
+        return float(value)
+    return str(value)
+
+
+# ── 工具 8：读长期记忆里的偏好 ──
+@tool
+def recall_preferences(user_id: str = "default") -> str:
+    """读这位研究者长期记忆里的分析偏好（阈值、上次用的分组）。
+
+    当用户说「按我上次的口径来 / 我习惯的阈值是多少」，或者你想知道
+    之前给这个人用什么阈值做的差异分析时调用。user_id 是用户标识。
+    """
+    try:
+        store = _memory_store()
+        item = store.get((*MEMORY_NS, user_id), PREFS_KEY)
+    except Exception as e:  # noqa: BLE001 - 记忆读失败不该让整轮对话崩掉
+        return f"读取长期记忆失败：{e}"
+    if item is None:
+        return f"长期记忆里还没有「{user_id}」的偏好记录（第一次来就是空的，正常）。"
+    # store 返回的是 Item(value=...)，也可能直接是 dict（不同后端略有差异）
+    value = getattr(item, "value", item)
+    if not isinstance(value, dict) or not value:
+        return f"长期记忆里「{user_id}」偏好为空或格式不认识：{value!r}"
+    body = "、".join(f"{k}={v}" for k, v in value.items() if k in PREF_FIELDS)
+    return f"长期记忆里「{user_id}」的偏好：{body or value}"
+
+
+# ── 工具 9：写一条偏好进长期记忆 ──
+@tool
+def save_preference(user_id: str, key: str, value: str) -> str:
+    """把一条分析偏好写进长期记忆，下次分析自动复用。
+
+    当用户明确表达了偏好（如「以后都用 FDR 0.01」「我一般叫 case/control」）
+    时调用。key 只能是 fc_threshold / fdr_threshold / group_a / group_b；
+    value 传字符串，这里会按字段类型转换后写回。
+    """
+    if key not in PREF_FIELDS:
+        return f"不认识的偏好字段「{key}」，只支持：{', '.join(PREF_FIELDS)}"
+    try:
+        store = _memory_store()
+    except Exception as e:  # noqa: BLE001
+        return f"长期记忆不可用，本次偏好没有保存：{e}"
+    namespace = (*MEMORY_NS, user_id)
+    try:
+        # 先读再合并：store.put 是整条覆盖，不合并的话会把别的偏好字段抹掉
+        item = store.get(namespace, PREFS_KEY)
+        current = dict(getattr(item, "value", item) or {}) if item is not None else {}
+        current[key] = _coerce_pref(key, value)
+        store.put(namespace, PREFS_KEY, current)
+    except Exception as e:  # noqa: BLE001 - 记忆写失败不影响主流程
+        return f"写长期记忆失败：{e}"
+    return f"已记住：{user_id} 的 {key} = {current[key]}（当前全部偏好：{current}）"
+
+
 TOOLS = [query_gene, run_differential, run_pca, run_clustering, search_literature,
-         list_skills, load_skill, *MCP_TOOLS]
+         list_skills, load_skill, recall_preferences, save_preference, *MCP_TOOLS]
+
+
+# ══════════ ReAct 护栏参数（可用环境变量覆盖）══════════
+# 为什么要有这几行：LangGraph 默认的 recursion_limit=25 是「super-step 上限」，
+# 一个工具轮 = agent + tools 两个 super-step，所以 25 大约等于 12 轮工具调用；
+# 而且一旦超限它抛 GraphRecursionError——如果不 catch，用户看到的是 traceback
+# 而不是回答。所以这里自己定义预算，并让框架上限与它对齐。
+MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "8"))           # 最多几轮工具调用
+TOOL_TIMEOUT = float(os.getenv("AGENT_TOOL_TIMEOUT", "30"))  # 单工具最长执行时间（秒）
+MAX_REPEAT = int(os.getenv("AGENT_MAX_REPEAT", "1"))         # 同一 (工具, 参数) 最多执行几次
+
+# 预算用尽时喂给模型的指令。注意：此时模型是「不带工具」的实例，
+# 从协议层面就拿掉了 tool_calls 能力，比只在提示词里求它别调工具可靠得多。
+LIMIT_NOTE = (
+    "【护栏】本轮最多允许 {max_steps} 次工具调用，现在已经用完。"
+    "请不要、也无法再调用任何工具，只能基于上面已经拿到的工具结果直接回答用户；"
+    "对于没有拿到的信息，明确写「未获取到」，并说明还需要哪一步（例如再做一次差异分析）才能补齐。"
+)
+
+
+class AgentState(MessagesState):
+    """ReAct 状态：在 messages 之外多记两样东西给护栏用。
+
+    MessagesState 已经定义了 messages（带 add_messages reducer，新消息是追加）；
+    下面三个字段走 LastValue 通道（后写的覆盖先写的），所以节点里要返回
+    「合并后的完整值」，不能只返回增量。
+    """
+    steps: int              # 已用掉的步数预算（= 已尝试过的工具调用次数）
+    calls: dict[str, int]   # 调用指纹 → 已执行次数，用来发现「原地打转」
+    guard_note: str         # 护栏触发时的说明，最终结果里带给调用方
+
+
+def _call_fingerprint(tool_name: str, args) -> str:
+    """工具调用指纹：同名工具 + 同样的参数 = 同一个指纹。
+
+    用 json.dumps(sort_keys=True) 而不是 hash(args)：
+      · dict 本身不可哈希；
+      · sort_keys 保证 {"a":1,"b":2} 与 {"b":2,"a":1} 指纹相同——模型重排参数
+        顺序是很常见的，按顺序不同判成不同调用就去不了重了。
+    """
+    try:
+        payload = json.dumps(args or {}, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001 - 参数里有不可序列化对象时退回 repr
+        payload = repr(args)
+    return f"{tool_name}|{payload}"
+
+
+# 工具执行池：给单工具超时用的。注意 Python 线程无法被强杀，超时只是
+# 「不再等它」——worker 会把这次调用跑完再释放。所以 max_workers 给到 4，
+# 即使偶尔卡死一个也不会让后续调用排队排到天荒地老。
+_TOOL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="react-tool")
+
+# 工具名 → 工具对象，避免每次调用都线性扫一遍列表
+_TOOL_BY_NAME = {t.name: t for t in TOOLS}
+
+
+def _run_one_tool(call: dict) -> str:
+    """执行单个工具调用；「工具不存在 / 参数错 / 超时 / 抛异常」全变成文本。
+
+    为什么全都返回字符串而不是抛异常：ToolMessage 里塞一段可读的失败原因，
+    模型下一轮就能自己纠（换个参数、换个工具、或者干脆基于已有信息作答），
+    这比把异常抛到图外面、让用户看 500 要好得多。
+    """
+    name = call.get("name") or ""
+    args = call.get("args") or {}
+    fn = _TOOL_BY_NAME.get(name)
+    if fn is None:
+        return (f"没有名为「{name}」的工具。可用工具："
+                f"{', '.join(sorted(_TOOL_BY_NAME))}")
+    if not isinstance(args, dict):
+        return f"工具 {name} 的参数必须是对象，收到的是：{args!r}"
+    try:
+        future = _TOOL_POOL.submit(lambda: str(fn.invoke(args)))
+        return future.result(timeout=TOOL_TIMEOUT)
+    except FutureTimeout:
+        return (f"工具 {name} 超过 {TOOL_TIMEOUT:.0f} 秒未返回，本次调用已放弃；"
+                "可以换更小的参数或换一个工具再试。")
+    except Exception as e:  # noqa: BLE001 - 参数校验失败、内部异常都交还模型
+        return f"工具 {name} 执行失败：{e}"
+
+
+def tools_node(state: AgentState) -> dict:
+    """执行模型这一轮点名的工具，把结果作为 ToolMessage 交还。
+
+    为什么不用现成的 ToolNode（这也是必须自己写的原因）：
+      ① 去重：同一个 (工具, 参数) 反复调用只会收到「已执行过」的提示，
+         直接掐掉「模型原地打转」这种最常见的浪费；
+      ② 单工具超时：某个工具（比如联网检索）卡住时不至于拖死整个请求；
+      ③ 计数：把用掉的步数写回 state，供 agent 节点判断预算。
+    ToolNode 能做的「异常变 ToolMessage」这里同样做了（见 _run_one_tool）。
+    """
+    last = state["messages"][-1]
+    calls = list(getattr(last, "tool_calls", None) or [])
+    seen = dict(state.get("calls") or {})
+    steps = int(state.get("steps") or 0)
+    out: list[ToolMessage] = []
+
+    for call in calls:
+        name = call.get("name") or ""
+        fingerprint = _call_fingerprint(name, call.get("args") or {})
+        used = seen.get(fingerprint, 0)
+        if used >= MAX_REPEAT:
+            # 拦掉但不扣「真实执行」的冤枉时间；提示里给出已有次数，让模型自己转方向
+            content = (f"重复调用已被拦截：{name} 用完全相同的参数已经执行过 {used} 次，"
+                       "结果就在上面的工具消息里。请直接基于已有信息作答，或换参数/换工具。")
+        else:
+            seen[fingerprint] = used + 1
+            content = _run_one_tool(call)
+        # 每个 tool_call 都必须回一条 ToolMessage（哪怕是被拦掉的），
+        # 否则下一轮把带 tool_calls 的 AIMessage 发给 API 会因为缺响应报 400。
+        out.append(ToolMessage(content=content, tool_call_id=call.get("id") or fingerprint,
+                               name=name))
+        # 被拦截的调用也计入步数：否则「模型一直重复同一个调用」时步数不涨，
+        # 预算永远用不完，护栏就形同虚设。
+        steps += 1
+
+    return {"messages": out, "steps": steps, "calls": seen}
 
 
 def build_agent_graph():
     """搭 ReAct 循环图，返回编译好的图。"""
+    global _STORE
     # bind_tools = 把工具清单「告诉」模型；此后模型才能输出 tool_calls
     model = get_model().bind_tools(TOOLS)
+    # 不绑工具的同一个模型：步数用尽时用它，从协议层面禁用 tool_calls
+    plain_model = get_model()
 
-    def agent_node(state):
-        """把整段对话喂给模型，返回模型的新回复（追加进 messages）。"""
-        return {"messages": [model.invoke(state["messages"])]}
+    def agent_node(state: AgentState) -> dict:
+        """把整段对话喂给模型，返回模型的新回复（追加进 messages）。
 
-    def should_continue(state):
-        """路由：模型最后一条消息带 tool_calls → 去执行工具；否则结束。"""
+        这里同时是「预算闸门」：步数用尽后换 plain_model，强制模型用已有
+        信息作答——这就是超限时的降级路径（而不是抛异常或死循环）。
+        """
+        steps = int(state.get("steps") or 0)
+        messages = list(state["messages"])
+        if steps >= MAX_STEPS:
+            note = LIMIT_NOTE.format(max_steps=MAX_STEPS)
+            return {
+                "messages": [plain_model.invoke(messages + [HumanMessage(content=note)])],
+                "guard_note": note,
+            }
+        return {"messages": [model.invoke(messages)]}
+
+    def should_continue(state: AgentState) -> str:
+        """路由：模型最后一条消息带 tool_calls → 去执行工具；否则结束。
+
+        注意这里不检查步数预算：预算的闸门放在 agent_node 里（进来前就判），
+        因为如果在这里把「还带着 tool_calls 的消息」直接送 END，那条 AIMessage
+        就永远等不到 ToolMessage，历史不完整，下次 invoke 会被 API 判 400。
+        """
         last = state["messages"][-1]
         return "tools" if getattr(last, "tool_calls", None) else END
 
-    builder = StateGraph(MessagesState)
+    builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
-    # handle_tool_errors=True：工具抛异常时，ToolNode 把异常变成 ToolMessage 交还模型，
-    # 而不是直接崩溃。这样「工具真失败」也走「模型再决策」的优雅路径。
-    builder.add_node("tools", ToolNode(TOOLS, handle_tool_errors=True))
+    builder.add_node("tools", tools_node)
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
     builder.add_edge("tools", "agent")  # 工具跑完，交还给 agent 再决策（循环）
     # 挂检查点：同一 thread_id 多次 invoke 会接着上次对话继续，中断也能续跑
-    return builder.compile(checkpointer=get_checkpointer())
+    # 挂 store：长期记忆（ReAct 侧的 recall_preferences / save_preference 靠它）
+    _STORE = get_store()
+    return builder.compile(checkpointer=get_checkpointer(), store=_STORE)
+
+
+def default_recursion_limit() -> int:
+    """把 LangGraph 的 super-step 上限和我们自己的步数预算对齐。
+
+    一轮 ReAct = agent + tools 两个 super-step，再留 4 步余量给收尾/降级。
+    显式设置的好处：不会出现「我们的护栏还没触发，LangGraph 先抛
+    GraphRecursionError」这种两套阈值打架的局面。
+    """
+    return MAX_STEPS * 2 + 4
+
+
+def run_react(question: str, thread_id: str = "agent-demo",
+              recursion_limit: int | None = None) -> dict:
+    """跑一次 ReAct，并把「图跑飞」这种框架级异常收成可读结果。
+
+    返回的 dict 里一定有 messages；如果撞上了框架上限，还会有
+    guard_note="react_recursion_limit"，调用方（web.py 的 /agent）据此
+    决定是提示用户拆问题还是照常展示。
+    """
+    graph = build_agent_graph()
+    limit = recursion_limit or default_recursion_limit()
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": limit,
+    }
+    initial = {"messages": [HumanMessage(question)], "steps": 0, "calls": {}}
+    try:
+        return graph.invoke(initial, config=config)
+    except GraphRecursionError as exc:
+        # 最后一道防线：即使护栏本身出问题（比如历史被外部塞得很长），
+        # 也不能把 traceback 甩给用户，要给一条能读懂的降级说明。
+        return {
+            "messages": [AIMessage(content=(
+                f"这个问题需要的工具轮数超过了安全上限（recursion_limit={limit}），"
+                "已中止本次自动探索。基于目前拿到的信息无法给出可靠结论，"
+                f"建议把问题拆小后重问。（内部错误：{exc}）"))],
+            "steps": 0,
+            "calls": {},
+            "guard_note": "react_recursion_limit",
+        }
 
 
 def main() -> int:
-    graph = build_agent_graph()
     question = (
         sys.argv[1]
         if len(sys.argv) > 1
@@ -295,11 +596,10 @@ def main() -> int:
     )
     print(f"问：「{question}」\n")
     # thread_id 是「会话钥匙」：同一 id 再次 invoke，会从上次的检查点接着聊
-    config = {"configurable": {"thread_id": "agent-demo"}}
-    result = graph.invoke({"messages": [HumanMessage(question)]}, config=config)
+    result = run_react(question, thread_id="agent-demo")
 
     # 逐条打印消息，看清 ReAct 的「想 → 调工具 → 看结果 → 再想 → 回答」过程
-    for i, msg in enumerate(result["messages"], 1):
+    for i, msg in enumerate(result.get("messages", []), 1):
         name = type(msg).__name__
         if getattr(msg, "tool_calls", None):
             for c in msg.tool_calls:
@@ -308,6 +608,12 @@ def main() -> int:
             print(f"[{i}] ToolMessage → 工具返回：{str(msg.content)[:120]}...")
         else:
             print(f"[{i}] {name} → {str(msg.content)}")
+
+    # 护栏触发时要让操作者看见，别把降级回答当成正常结论
+    steps = result.get("steps", 0)
+    print(f"\n本次共尝试 {steps} 次工具调用（预算 {MAX_STEPS} 次）。")
+    if result.get("guard_note"):
+        print(f"⚠️ 护栏触发：{result['guard_note']}")
     return 0
 
 

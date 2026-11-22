@@ -5,6 +5,22 @@ import unittest
 from omics_agent import metrics, resilience
 
 
+def setUpModule():
+    """熔断器后端是**模块级全局**：web.py 一被 import 就会把它切到 Redis
+    （跨进程熔断需要这样）。但本模块断言的是「进程内熔断」语义，一旦后端是 Redis，
+    状态就变成跨测试、跨进程共享 —— 本机上一个用例刚打开过的键，会让下一个用例
+    直接拿到 CircuitOpenError，测试结果就依赖执行顺序了。
+
+    所以这里显式切回进程内。这不是把断言改松，而是给全局状态做隔离：
+    用例在任何顺序下都必须同样成立。
+    """
+    resilience.configure_breaker_backend(None)
+
+
+def tearDownModule():
+    resilience.configure_breaker_backend(None)
+
+
 class FakeStructured:
     def __init__(self, owner):
         self.owner = owner

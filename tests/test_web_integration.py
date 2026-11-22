@@ -302,9 +302,15 @@ class WebIntegrationTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(r.status_code, 200, r.text)
-        dataset_path = r.json()["dataset_path"]  # 形如 data/upload/<uuid>
+        dataset_path = r.json()["dataset_path"]  # 绝对路径，落在 UPLOAD_ROOT 下
         try:
-            self.assertTrue(dataset_path.replace("\\", "/").startswith("data/upload"))
+            # 上传必须落在 UPLOAD_ROOT 里。以前这里断言 startswith("data/upload")，
+            # 那断的是"相对 CWD 落盘"的旧契约 —— 而相对落盘会在换工作目录启动时
+            # 造成"上传成功、分析一律 400（不在 data/ 内）"，是个真缺陷。
+            self.assertEqual(
+                os.path.realpath(os.path.dirname(dataset_path)), web.UPLOAD_ROOT
+            )
+            self.assertTrue(os.path.isdir(dataset_path))
 
             # 真上传目录走完整分析：证明"文件名净化 + 路径校验 + 内容识别"三者能串起来
             self._use_model(FakeModel())

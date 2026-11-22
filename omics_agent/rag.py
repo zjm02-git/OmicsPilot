@@ -9,6 +9,18 @@
 为什么单独抽成一个函数：
   - 检索逻辑写一遍，测试脚本用、LangGraph 节点也用，不重复
   - 数据是「惰性加载」：真正调用时才开始读文件，import 这个模块时不吃内存
+
+检索从一路变成三档（都是同一个函数家族的成员，形状一致可互换）：
+  retrieve_genes           纯向量        基线，也是最贵的语义路径
+  retrieve_bm25            纯 BM25       字面基线，评测里用来证明「向量到底有没有用」
+  retrieve_hybrid          向量+BM25+RRF 产品默认（nodes.py 现在就在用）
+  retrieve_hybrid_reranked 上面这档 + LLM 重排（给调度方一行调用，带开关/缓存/降级）
+
+中文这一跳的两个坑（修在 bm25.py，但结论写在这里，因为这里是检索入口）：
+  1) 旧切词只认 ASCII，中文提问切出空词表，BM25 一路 0 命中 → 混合检索退化成纯向量；
+  2) 光修切词还不够：卡片是英文通路名，汉字只出现在模板串里，所以中文提问
+     仍然命不中——还要靠 bm25.expand_query 的中→英种子词表补一跳。
+  评测（evals/run_rag_eval.py）把这两层分别量出来：bm25 / bm25_nogloss 两列。
 """
 """
 导入 4 个工具
@@ -170,13 +182,43 @@ def _get_bm25():
     return _bm25
 
 
-def retrieve_hybrid(question: str, top_k: int = 5, rrf_k: int = 60):
+def load_cards():
+    """返回卡片表（gene / description 两列），供评测脚本算「数据侧指标」。
+
+    为什么要暴露这个：评测要算「同源泄漏」——问题里的通路名是否逐字出现在
+    金标卡片里——这必须拿到原始卡片文本。让评测脚本去摸 _load() 这种私有函数
+    会把内部实现焊死在脚本里，所以给一个显式出口。
+    """
+    _, cards, _ = _load()
+    return cards
+
+
+def retrieve_bm25(question: str, top_k: int = 5, expand_zh: bool = True):
+    """只用 BM25 的字面检索（评测里的「BM25-only 基线」也走这里）。
+
+    为什么单独暴露：混合检索的收益必须和「只用 BM25」比才说得清，
+    否则回答不了「那向量那一路到底有没有用」。也方便排查
+    「某条问题为什么没被召回」——把两路分开看比看融合结果直观。
+    """
+    _, cards, _ = _load()
+    hits = _get_bm25().search(question, top_k=top_k, expand_zh=expand_zh)
+    return [(cards.iloc[d]["gene"], cards.iloc[d]["description"], float(s)) for d, s in hits]
+
+
+def retrieve_hybrid(question: str, top_k: int = 5, rrf_k: int = 60, expand_zh: bool = True):
     """混合检索：向量 + BM25 两路各自排名，用 RRF 融合后取前 top_k。
 
     为什么 RRF（Reciprocal Rank Fusion）：
       向量分数是余弦相似度（约 0~1），BM25 分数是无上界的加权词频，两把尺子
       不能直接相加。RRF 只看「排名」不看绝对分——每个基因在每路里的名次
       换算成 1/(rrf_k + 名次) 再累加，跨尺度也能公平融合。
+
+    参数 rrf_k：RRF 的平滑常数。越小越「奖励第一名」（排名差距被放大），
+      越大越「平均看待两路」。经典取值 60，评测里做了 10/60/100 的消融——
+      这个数不该靠抄论文，应该在自己的数据上选。
+
+    参数 expand_zh：是否启用中→英词表扩展（默认开）。传 False 就是
+      「只有 CJK 二元组、没有双语词表」那一档，评测拿它做消融。
 
     返回：[(基因名, 原文, RRF 分数), ...]，形状和 retrieve_genes 一致。
     """
@@ -186,7 +228,8 @@ def retrieve_hybrid(question: str, top_k: int = 5, rrf_k: int = 60):
     vec_ranked = _vector_ranks(question)  # [(doc_id, 相似度), ...] 已按相似度降序
 
     # ② BM25 这一路的排名（只返回命中了查询词的文档）
-    bm25_ranked = _get_bm25().search(question, top_k=len(cards))  # [(doc_id, bm25分), ...]
+    #    expand_zh=True：除 CJK 二元组外，再并入中→英词表扩展项（英文提问不受影响）
+    bm25_ranked = _get_bm25().search(question, top_k=len(cards), expand_zh=expand_zh)  # [(doc_id, bm25分), ...]
 
     # ③ RRF 融合：名次从 1 起，只在某一路出现过的文档只累加该路的分
     rrf = {}
@@ -197,6 +240,30 @@ def retrieve_hybrid(question: str, top_k: int = 5, rrf_k: int = 60):
 
     order = sorted(rrf, key=lambda d: rrf[d], reverse=True)[:top_k]
     return [(cards.iloc[d]["gene"], cards.iloc[d]["description"], rrf[d]) for d in order]
+
+
+# ================= 第 4.6 块：混合召回 + LLM 重排（一行调用）=================
+def retrieve_hybrid_reranked(question: str, top_k: int = 5, rrf_k: int = 60, pool: int = 20,
+                             expand_zh: bool = True, return_info: bool = False):
+    """混合召回 + LLM 重排：给调度方的「一行调用」入口。
+
+    为什么分两段（粗召回 pool 个 → 重排只取 top_k）：
+      重排只能重排「已经在候选里的东西」。如果 pool == top_k，重排最多在
+      5 个里调个顺序，翻盘空间几乎没有；先粗召回 20 个再让 LLM 挑 5 个，
+      才有机会把融合排序里被埋掉的相关项捞上来。代价是多一次 LLM 往返。
+
+    为什么 rerank 要在这里延迟 import：
+      omics_agent.rerank 依赖 langchain + DeepSeek 客户端；而「不重排」的链路
+      （nodes.py 现在用的 retrieve_hybrid）不该被迫背上这份依赖——
+      import rag 还是像原来一样轻。
+
+    返回：[(基因名, 原文, 分数), ...]，与 retrieve_hybrid 同形状，可直接替换。
+          return_info=True 时返回 (结果, info)，info["status"] 说明这次是
+          真的重排了（ok/cache_hit）还是降级了（disabled/llm_error/...）。
+    """
+    candidates = retrieve_hybrid(question, top_k=max(pool, top_k), rrf_k=rrf_k, expand_zh=expand_zh)
+    from omics_agent.rerank import maybe_rerank   # 延迟导入，理由见上面的 docstring
+    return maybe_rerank(question, candidates, top_k=top_k, return_info=return_info)
 
 
 def get_gene_function(gene: str):
