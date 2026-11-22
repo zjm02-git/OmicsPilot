@@ -1,24 +1,24 @@
 {
-  "generated_at": "2026-11-12 21:19:15",
+  "generated_at": "2026-11-23 01:04:10",
   "cache_hit_load": {
     "concurrency": 32,
     "requests": 512,
     "completed": 512,
     "errors": 0,
     "error_samples": [],
-    "wall_s": 7.0,
-    "throughput_rps": 73.2,
-    "p50_ms": 153.5,
-    "p90_ms": 237.11,
-    "p95_ms": 312.01,
-    "p99_ms": 339.8,
-    "mean_ms": 164.35
+    "wall_s": 6.65,
+    "throughput_rps": 77.0,
+    "p50_ms": 149.29,
+    "p90_ms": 243.25,
+    "p95_ms": 267.79,
+    "p99_ms": 330.88,
+    "mean_ms": 157.96
   },
   "redis_down": {
     "status_code": 200,
     "from_cache": true,
     "cache_source": "local",
-    "latency_ms": 247.8,
+    "latency_ms": 217.78,
     "report_ok": true
   },
   "retry_ab": {
@@ -37,39 +37,39 @@
   },
   "llm_down": {
     "status_code": 200,
-    "total_s": 0.24,
-    "report_chars": 2326,
+    "total_s": 5.08,
+    "report_chars": 2750,
     "degraded_but_served": true
   },
   "cold_path": {
     "runs": [
       {
-        "analyze_s": 3.96,
+        "analyze_s": 4.8,
         "status": "pending_confirm",
         "from_cache": false,
-        "confirm_s": 22.44,
-        "report_chars": 4420,
-        "total_s": 26.4
+        "confirm_s": 19.25,
+        "report_chars": 4388,
+        "total_s": 24.05
       },
       {
-        "analyze_s": 2.21,
+        "analyze_s": 3.48,
         "status": "pending_confirm",
         "from_cache": false,
-        "confirm_s": 18.42,
-        "report_chars": 4073,
-        "total_s": 20.63
+        "confirm_s": 22.24,
+        "report_chars": 5637,
+        "total_s": 25.72
       },
       {
-        "analyze_s": 2.45,
+        "analyze_s": 3.97,
         "status": "pending_confirm",
         "from_cache": false,
-        "confirm_s": 16.56,
-        "report_chars": 3814,
-        "total_s": 19.01
+        "confirm_s": 25.34,
+        "report_chars": 5828,
+        "total_s": 29.31
       }
     ],
-    "median_total_s": 20.63,
-    "max_total_s": 26.4,
+    "median_total_s": 25.72,
+    "max_total_s": 29.31,
     "all_cold": true
   }
 }

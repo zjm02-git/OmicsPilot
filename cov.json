@@ -1,10 +1,22 @@
 {
   "files": [
     {
+      "file": "diff.py",
+      "exec_lines": 142,
+      "covered": 132,
+      "coverage_pct": 93.0
+    },
+    {
+      "file": "enrichment.py",
+      "exec_lines": 68,
+      "covered": 47,
+      "coverage_pct": 69.1
+    },
+    {
       "file": "cache.py",
-      "exec_lines": 176,
-      "covered": 155,
-      "coverage_pct": 88.1
+      "exec_lines": 182,
+      "covered": 161,
+      "coverage_pct": 88.5
     },
     {
       "file": "context.py",
@@ -20,9 +32,9 @@
     },
     {
       "file": "jobs.py",
-      "exec_lines": 83,
-      "covered": 76,
-      "coverage_pct": 91.6
+      "exec_lines": 183,
+      "covered": 151,
+      "coverage_pct": 82.5
     },
     {
       "file": "metrics.py",
@@ -32,19 +44,19 @@
     },
     {
       "file": "resilience.py",
-      "exec_lines": 161,
-      "covered": 153,
-      "coverage_pct": 95.0
+      "exec_lines": 476,
+      "covered": 302,
+      "coverage_pct": 63.4
     },
     {
       "file": "web.py",
-      "exec_lines": 383,
-      "covered": 319,
-      "coverage_pct": 83.3
+      "exec_lines": 684,
+      "covered": 462,
+      "coverage_pct": 67.5
     }
   ],
-  "total_exec_lines": 1047,
-  "total_covered": 928,
-  "coverage_pct": 88.6,
-  "tests_run": 73
+  "total_exec_lines": 1979,
+  "total_covered": 1480,
+  "coverage_pct": 74.8,
+  "tests_run": 80
 }
