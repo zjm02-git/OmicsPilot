@@ -91,13 +91,16 @@ class StreamQueue:
     def claim_stale(self, consumer: str, count: int = 100) -> list[tuple[str, dict]]:
         """XAUTOCLAIM：把「超过可见性超时还没确认」的消息抢到自己名下处理。"""
         try:
-            _next_start, claimed, _deleted = self.redis.xautoclaim(
+            resp = self.redis.xautoclaim(
                 self.stream, self.group, consumer,
                 min_idle_time=self.visible_timeout_ms, start_id="0-0", count=count,
             )
         except ResponseError:
             self.ensure_group()
             return []
+        # redis-py 版本差异：>=5.0 返回 (next_id, messages, deleted_ids)，旧版返回 (next_id, messages)
+        # 统一取第 2 个元素（messages），避免不同环境装的 redis-py 版本不同导致解包报错
+        claimed = resp[1]
         if claimed:
             metrics.incr("queue_claim_total", value=len(claimed))
         return claimed
