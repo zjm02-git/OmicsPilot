@@ -21,6 +21,13 @@
 from __future__ import annotations
 
 import os
+
+# 限流的桶存在共享 Redis 里，跨运行不清空：反复跑测试会把注册窗口（10 次/小时）
+# 耗尽，后续用例全被 429 挡掉，看着像接口坏了。这里关掉限流做测试隔离。
+# ratelimit._enabled() 每次调用现读环境变量，因此与 import 顺序无关。
+os.environ["RATELIMIT_ENABLED"] = "false"
+
+import os
 import shutil
 import time
 import unittest

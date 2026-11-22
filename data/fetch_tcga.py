@@ -32,6 +32,7 @@
 产物，缺失值已经被补成 0，没有"原地修复"的办法，只能重新拉一遍。
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import json
 import math
@@ -46,12 +47,25 @@ OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "d
 
 
 def _post(query: dict) -> dict:
-    req = urllib.request.Request(
-        GDC_FILES, data=json.dumps(query).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)
+    """GDC 查询接口（带重试）。
+
+    GDC 会偶发 WinError 10054（远端强制关闭连接）。这一段没有重试的话，
+    一次瞬时抖动就会让整个下载在第一步死掉 —— 实测踩到过一次：
+    0 个文件、进程直接退出，看起来像"代码坏了"，其实只是连接被重置。
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                GDC_FILES, data=json.dumps(query).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.load(r)
+        except Exception as exc:  # noqa: BLE001 - 统一重试
+            last_err = exc
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"GDC 查询失败（重试 3 次后）：{last_err}")
 
 
 def _split_barcode(submitter_id: str) -> dict:
@@ -135,17 +149,52 @@ def dedupe_aliquots(samples: list) -> tuple:
     return kept, dropped
 
 
+# 并发 8：GDC 会限流，开太高反而更容易被拖住或拒连；
+# 串行时单文件常有数分钟空闲等待，226 个样本要几十小时，不可接受。
+# 并发与超时的取值来自实测，不是拍脑袋：
+#   - 串行时单个文件出现过"8 分钟零字节，然后 55 秒拉完 4.2MB"；
+#   - 并发 8 时观察到 8 个连接同时卡在 0 字节超过 5 分钟。
+# 说明 GDC 会先把连接挂住排队、再一次性给数据。所以：
+#   - 单文件超时必须显著大于排队时间，120s 会把合法下载杀掉（实测踩到）→ 480s；
+#   - 并发不能太高，8 路会把 GDC 的排队拖长 → 6 路。
+DOWNLOAD_WORKERS = int(os.getenv("TCGA_DOWNLOAD_WORKERS", "6"))
+DOWNLOAD_TIMEOUT_S = int(os.getenv("TCGA_DOWNLOAD_TIMEOUT_S", "480"))
+DOWNLOAD_RETRIES = int(os.getenv("TCGA_DOWNLOAD_RETRIES", "3"))
+
+
 def download(file_id: str, dest: str) -> None:
-    """下载一个样本文件，带重试。"""
+    """下载一个样本文件（**单次尝试**，重试交给 fetch_sample 统一管）。
+
+    超时放这里而不是外层：卡住的是这一个连接，超时才能把它单独打断，
+    不牵连同批次其它样本。
+    """
     req = urllib.request.Request(GDC_DATA + "/" + file_id, headers={"User-Agent": "Mozilla/5.0"})
-    for attempt in range(3):
+    with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT_S) as r, open(dest, "wb") as f:
+        f.write(r.read())
+
+
+def fetch_sample(file_id: str, dest: str) -> dict:
+    """下载 + 完整性校验 + 解析；任一步失败都重试整条链路（最多 DOWNLOAD_RETRIES 次）。
+
+    为什么校验必须在这里：并行之后"写半截文件"的危害被放大了 ——
+    一个 0 字节的 TSV 会被解析成空 dict，静默变成"这个样本什么都没测到"，
+    最后以 100% 缺失的形式污染整张矩阵，而且没有任何报错。
+    所以两条都查：字节数 > 0、能解析出非空的 {gene: fpkm}。
+    """
+    last_err = None
+    for attempt in range(DOWNLOAD_RETRIES):
         try:
-            with urllib.request.urlopen(req, timeout=180) as r, open(dest, "wb") as f:
-                f.write(r.read())
-            return
-        except Exception:
-            time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"下载失败 {file_id}")
+            download(file_id, dest)
+            if os.path.getsize(dest) <= 0:
+                raise RuntimeError("下载结果为空文件")
+            vals = parse_sample(dest)
+            if not vals:
+                raise RuntimeError("解析不出任何蛋白编码基因")
+            return vals
+        except Exception as exc:  # noqa: BLE001 - 统一重试，最后一次抛出
+            last_err = exc
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"下载/解析失败 {file_id}: {last_err}")
 
 
 def parse_sample(path: str) -> dict:
@@ -191,7 +240,12 @@ def _report_dedupe(label: str, raw: list, kept: list, dropped: list) -> None:
     )
 
 
-def main(redownload: bool = False) -> None:
+def main(redownload: bool = False, per_group: int | None = None) -> None:
+    """per_group：每组最多保留多少个样本（None = 不设上限，按 500 候选去重后配平）。
+
+    先用小规模跑通链路是必要的：GDC 单文件实测要 8 分钟左右，
+    226 个样本要 5 小时；120 个（60 vs 60）约 2.7 小时，够验证口径了。
+    """
     os.makedirs(OUT_DIR, exist_ok=True)
     expr_path = os.path.join(OUT_DIR, "expression.csv")
     meta_path = os.path.join(OUT_DIR, "metadata.csv")
@@ -214,6 +268,9 @@ def main(redownload: bool = False) -> None:
     normal_all = [{**s, "condition": "normal"} for s in normal_raw]
     normal, normal_dup = dedupe_aliquots(normal_all)
     _report_dedupe("normal", normal_all, normal, normal_dup)
+    if per_group:
+        normal = normal[:per_group]
+        print(f"  normal: 按 --per-group 截到 {len(normal)} 个")
 
     # 肿瘤多取一倍候选，抵消重复等分被去掉的损耗；去重后再截到与正常组同规模，
     # 保证两组样本数平衡（n 不平衡会让方差估计和检验力都变差）。
@@ -235,23 +292,49 @@ def main(redownload: bool = False) -> None:
         f"按病人去重共去掉 {len(tumor_dup) + len(normal_dup)} 份重复等分"
     )
 
-    # 2. 下载 + 解析，累积 gene -> {sample: value}
-    print("== 下载并解析样本 ==")
+    # 2. 并行下载 + 解析，累积 gene -> {sample: value}
+    print(f"== 下载并解析样本（并发 {DOWNLOAD_WORKERS}，单文件超时 {DOWNLOAD_TIMEOUT_S}s）==")
+    t_start = time.time()
+    results = {}       # sample_id -> {gene: fpkm}；先收齐再归并，避免线程互踩
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_sample, s["file_id"], os.path.join(raw_dir, s["file_id"] + ".tsv")): s
+            for s in samples
+        }
+        failures = []
+        for done, fut in enumerate(as_completed(futures), 1):
+            s = futures[fut]
+            try:
+                results[s["sample_id"]] = fut.result()
+            except Exception as exc:  # noqa: BLE001 - 单个样本失败不能拖死整批
+                failures.append((s["sample_id"], f"{type(exc).__name__}: {exc}"[:120]))
+            if done % 10 == 0 or done == len(samples):
+                print(f"  进度 {done}/{len(samples)}，失败 {len(failures)}"
+                      f"（{time.time() - t_start:.0f}s）", flush=True)
+
+    # 有样本彻底失败就不落盘：宁可这次白跑，也不能产出一张"某几个样本全空"的残缺矩阵，
+    # 那种矩阵能被下游一路算下去，且没有任何报错。
+    if failures:
+        print(f"  × 失败样本 {len(failures)} 个：")
+        for sid, err in failures[:15]:
+            print(f"    - {sid}: {err}")
+        raise SystemExit(
+            f"{len(failures)} 个样本下载失败，未写出 expression.csv。"
+            "重跑一次即可（已下载的样本会重新拉，GDC 有缓存会快很多）。"
+        )
+
+    # 基因顺序取样本列表里的**第一个**：并行完成顺序是乱的，
+    # 用"先完成"的那个当基准会让每次产出的列序不稳定。
+    gene_order = list(results[samples[0]["sample_id"]].keys())
     expr = {}          # gene -> {sample_id: fpkm_uq}；缺失的 key 就是"没测到"
-    gene_order = None  # 用第一个文件的基因顺序，保证对齐
     measured = {}      # sample_id -> 有值的基因集合（用来数每个样本缺了多少）
-    for i, s in enumerate(samples, 1):
-        fid, sub = s["file_id"], s["sample_id"]
-        dest = os.path.join(raw_dir, fid + ".tsv")
-        download(fid, dest)
-        vals = parse_sample(dest)
-        if gene_order is None:
-            gene_order = list(vals.keys())
-        measured[sub] = set(vals.keys())
+    for s in samples:
+        sid = s["sample_id"]
+        vals = results[sid]
+        measured[sid] = set(vals.keys())
         for g, v in vals.items():
-            expr.setdefault(g, {})[sub] = v
-        print(f"  [{i}/{len(samples)}] {sub}（{s['condition']}）{len(vals)} 个蛋白编码基因")
-        time.sleep(0.1)
+            expr.setdefault(g, {})[sid] = v
+    print(f"  下载完成：{len(samples)} 个样本，用时 {time.time() - t_start:.0f}s")
 
     sample_ids = [s["sample_id"] for s in samples]
     gene_set = set(gene_order)
@@ -297,4 +380,9 @@ if __name__ == "__main__":
         "--redownload", action="store_true",
         help="重新从 GDC 拉取并覆盖 data/expression.csv 与 data/metadata.csv",
     )
-    main(redownload=ap.parse_args().redownload)
+    ap.add_argument(
+        "--per-group", type=int, default=None,
+        help="每组最多保留多少个样本（不传=全量）。先用小规模验证口径时用它",
+    )
+    _args = ap.parse_args()
+    main(redownload=_args.redownload, per_group=_args.per_group)

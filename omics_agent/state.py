@@ -28,6 +28,9 @@ class AnalysisState(TypedDict, total=False):
     qc_report: str        # 质检报告（文字）
     group_a: str          # A 组名字
     group_b: str          # B 组名字
+    review_decision: str  # HITL 的结论："approved" / "rejected"。
+                          # 单独一个字段是必须的：用户主动取消 ≠ 质检没通过，
+                          # 只看 qc_passed 会把"已取消"渲染成"质检未通过"。
 
     # ── 分析参数（可被长期记忆里的偏好覆盖）──
     fc_threshold: float   # log2FC 阈值，默认 1.0

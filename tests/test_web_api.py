@@ -4,8 +4,15 @@
 但仍然真实走一遍路由、校验、中间件——改坏契约会在这里先炸，而不是等前端发现。
 """
 
+import os
 import unittest
 import uuid
+
+# 限流的桶存在**共享 Redis** 里（跨进程、跨运行都不清空）。不关掉的话，
+# 反复跑测试会把 10 次/小时的注册窗口耗尽，之后 register 全返回 429，
+# 看起来像"接口坏了"，其实是测试之间在互相污染。
+# 注意：ratelimit._enabled() 是每次调用现读环境变量，所以这句与 import 顺序无关。
+os.environ["RATELIMIT_ENABLED"] = "false"
 
 try:
     from fastapi.testclient import TestClient

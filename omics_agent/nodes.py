@@ -292,6 +292,16 @@ def load_qc_node(state: dict, runtime: Runtime) -> dict:
     }
 
 
+# HITL 里给用户选的阈值档位。为什么必须给：
+# 没有这个选择，"记住用户偏好"就永远是假的 —— 用户没有任何入口去改阈值，
+# save_memory 存进去的只可能是默认值 1.0/0.05，读回来当然也是默认值。
+THRESHOLD_PRESETS = [
+    {"name": "宽松", "fc_threshold": 0.58, "fdr_threshold": 0.1},
+    {"name": "标准（默认）", "fc_threshold": 1.0, "fdr_threshold": 0.05},
+    {"name": "严格", "fc_threshold": 2.0, "fdr_threshold": 0.01},
+]
+
+
 # ══════════ ③ 人工确认（HITL） ══════════
 def human_review_node(state: dict) -> dict:
     """质检通过后暂停，把结果给人看，等人确认后才继续分析。"""
@@ -301,10 +311,29 @@ def human_review_node(state: dict) -> dict:
         "qc_report": state.get("qc_report", ""),
         "group_a": state.get("group_a"),
         "group_b": state.get("group_b"),
+        # 把当前阈值和可选档位一起抛给前端：用户必须有机会改，
+        # 否则「长期记忆记住偏好」这件事从头到尾没有数据来源。
+        "current_thresholds": {
+            "fc_threshold": state.get("fc_threshold", 1.0),
+            "fdr_threshold": state.get("fdr_threshold", 0.05),
+        },
+        "threshold_options": THRESHOLD_PRESETS,
     })
     if isinstance(decision, dict) and decision.get("approved") is False:
-        return {"qc_passed": False, "qc_report": "已由用户取消分析"}
-    return {}
+        # 用户主动取消 ≠ 质检没通过：用独立字段记下来，交给 report_node 分情况渲染。
+        return {
+            "qc_passed": False,
+            "review_decision": "rejected",
+            "qc_report": "已由用户取消分析",
+        }
+    out = {"review_decision": "approved"}
+    if isinstance(decision, dict):
+        # 这一轮用户在确认时显式选的阈值（没传就沿用 state 里现有的值）
+        for key in ("fc_threshold", "fdr_threshold"):
+            val = decision.get(key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                out[key] = float(val)
+    return out
 
 
 # ══════════ ④ 差异表达分析 ══════════
@@ -741,13 +770,21 @@ def report_node(state: dict) -> dict:
             "final_report": "# 知识库问答\n\n" + state.get("qa_answer", "")
         }
 
-    # 情况5：质检失败（或人工确认时取消）
+    # 情况5：人工确认时用户主动取消（数据本身没问题，不能说成"质检未通过"）
+    if state.get("review_decision") == "rejected":
+        return {
+            "final_report": "# 分析报告\n\n## 已由用户取消\n\n"
+            "数据质检已通过，是你在确认环节取消了本次分析。"
+            "如需继续，重新提交同一份数据即可（缓存里没有留下任何半成品）。"
+        }
+
+    # 情况6：质检未通过（数据本身不合格）
     if not state.get("qc_passed", False):
         return {
             "final_report": "# 分析报告\n\n## 质检未通过\n\n" + state.get("qc_report", "")
         }
 
-    # 情况6：正常完整报告
+    # 情况7：正常完整报告
     param_src = "来自长期记忆" if state.get("prefs_from_memory") else "默认"
     lines = [
         "# 多组学数据分析报告",

@@ -762,6 +762,20 @@ class AnalizeRequest(BaseModel):
 class ConfirmRequest(BaseModel):
     thread_id: str
     approved: bool
+    # 可选：人工确认这一轮可以显式指定阈值（不传就沿用当前值/记忆里的偏好）。
+    # 没有这两个字段，用户就没有任何入口改阈值，"记住偏好"只能是默认值。
+    fc_threshold: float | None = None
+    fdr_threshold: float | None = None
+
+
+def _resume_payload(req: ConfirmRequest) -> dict:
+    """把确认请求翻译成 interrupt 的 resume 值（只带用户真正给了的字段）。"""
+    payload: dict = {"approved": req.approved}
+    if req.fc_threshold is not None:
+        payload["fc_threshold"] = float(req.fc_threshold)
+    if req.fdr_threshold is not None:
+        payload["fdr_threshold"] = float(req.fdr_threshold)
+    return payload
 
 
 def _validate_dataset_path(raw: str) -> str:
@@ -824,6 +838,10 @@ def _run_graph(asg: AnalizeRequest, dataset_path: str, history_user_id: int, cac
             "qc_report": info.get("qc_report"),
             "group_a": info.get("group_a"),
             "group_b": info.get("group_b"),
+            # 把当前阈值和可选档位一起返回：前端据此渲染选择控件，
+            # 用户选的档位会经 /confirm 写回 state，并由 save_memory 落进长期记忆。
+            "current_thresholds": info.get("current_thresholds"),
+            "threshold_options": info.get("threshold_options"),
         }
 
     final_report = result.get("final_report") or ""
@@ -835,6 +853,11 @@ def _run_graph(asg: AnalizeRequest, dataset_path: str, history_user_id: int, cac
         final_report=final_report,
     )
     body = {"status": "done", "report": final_report, "thread_id": thread_id}
+    if result.get("review_decision") == "rejected":
+        # 用户主动取消：这份"报告"只是一句说明，不是分析结果。
+        # 标出来让 _run_and_cache 不要把它当正品缓存 —— 否则用户取消一次，
+        # 24 小时内再提交同一份数据会直接命中这份"已取消"的说明，改不了主意。
+        body["canceled"] = True
     if result.get("degraded"):
         # 降级产出（模型不可用时只剩统计摘要）必须让调用方知道，前端才好提示"建议稍后重试"
         body["degraded"] = True
@@ -870,7 +893,10 @@ def _run_and_cache(asg: AnalizeRequest, dataset_path: str, key: str, history_use
     if body.get("status") == "done" and body.get("report"):
         # 只缓存完整报告：pending 还没算完；降级报告（模型挂了只有统计摘要）写进去
         # 会让后续 24 小时的所有同问请求都拿到这份残缺内容。
-        if body.get("degraded"):
+        if body.get("canceled"):
+            # 取消不是有效产出：不写缓存，用户改主意可以立刻重跑
+            metrics.incr("cache_skip_canceled_total")
+        elif body.get("degraded"):
             metrics.incr("cache_skip_degraded_total")
         else:
             CACHE.set(key, body["report"])
@@ -979,13 +1005,13 @@ def confirm(req: ConfirmRequest, user: dict = Depends(get_current_user)):
     engine = _require_graph()
     try:
         with metrics.timer("graph.phase2_ms"):
-            result = engine.invoke(Command(resume={"approved": req.approved}), config=config)
+            result = engine.invoke(Command(resume=_resume_payload(req)), config=config)
             rounds = 0
             while result.get("__interrupt__") and rounds < MAX_RESUME_ROUNDS:
                 # 还中断就继续续跑；但必须有轮数上限，否则异常输入能卡死一个线程
                 rounds += 1
                 metrics.incr("graph.resume_round_total")
-                result = engine.invoke(Command(resume={"approved": req.approved}), config=config)
+                result = engine.invoke(Command(resume=_resume_payload(req)), config=config)
     except Exception as exc:  # noqa: BLE001
         metrics.incr("confirm_error_total")
         raise HTTPException(status_code=400, detail=f"确认失败，会话可能已失效：{exc}") from exc
@@ -1003,9 +1029,13 @@ def confirm(req: ConfirmRequest, user: dict = Depends(get_current_user)):
     # 永远不会命中缓存（差异分析主路径就是这样漏掉的）。
     # 但降级报告不能回填 —— 否则一次模型抖动会污染 24 小时内的所有同问请求。
     degraded = bool(result.get("degraded"))
+    canceled = result.get("review_decision") == "rejected"
     pending_key = _pop_pending(req.thread_id)
     if pending_key and final_report:
-        if degraded:
+        if canceled:
+            # 取消不是有效产出：回填了就等于"用户取消一次，24 小时内改不了主意"
+            metrics.incr("cache_skip_canceled_total")
+        elif degraded:
             metrics.incr("cache_skip_degraded_total")
         else:
             CACHE.set(pending_key, final_report)
