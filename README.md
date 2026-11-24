@@ -2,7 +2,7 @@
 
 > 用 **LangGraph** 把「基因表达数据分析」这条多步骤流程，编排成一个**能持久化、能人工确认、能记住偏好、能自动解读、并且扛得住外部依赖故障**的 AI Agent。
 
-[![tests](https://img.shields.io/badge/tests-73%20passed-brightgreen)]() [![coverage](https://img.shields.io/badge/coverage-88.6%25-green)]() [![python](https://img.shields.io/badge/python-3.12-blue)]()
+[![tests](https://img.shields.io/badge/tests-80%20passed-brightgreen)]() [![coverage](https://img.shields.io/badge/coverage-74.8%25-green)]() [![python](https://img.shields.io/badge/python-3.12-blue)]()
 
 ---
 
@@ -22,7 +22,7 @@
 
 **OmicsAgent 做的事**：用 LangGraph 的「图」把这条流水线变成一个个**节点**，让大模型（LLM）负责"理解需求 + 解读结果"，让 Python 负责"质检 + 统计计算"，中间用**检查点**保存进度、用**条件边**做路由。这样一个不懂生物的人，说一句"帮我找差异表达基因"，就能拿到一份带解读的分析报告。
 
-**但它不只是一个能跑的 demo**：真实模型一次分析要 20 秒，外部依赖（Redis / 模型网关 / MySQL）任何一环抖动都会让请求失败。所以外面还套了一层**服务层**——缓存一致性、降级、熔断重试、上下文预算、异步任务、健康检查与指标、73 个自动化测试。这一层才是它像"系统"而不是"脚本"的地方。
+**但它不只是一个能跑的 demo**：真实模型一次分析要 25 秒上下，外部依赖（Redis / 模型网关 / MySQL）任何一环抖动都会让请求失败。所以外面还套了一层**服务层**——缓存一致性、降级、熔断重试、上下文预算、异步任务、健康检查与指标、80 个自动化测试。这一层才是它像"系统"而不是"脚本"的地方。
 
 ---
 
@@ -133,7 +133,7 @@
 │   ├── queue.py             # Redis Stream 队列（XADD/XREADGROUP/XAUTOCLAIM/死信）
 │   └── metrics.py           # 零依赖指标：计数器 + P50/P95/P99 + 请求 ID
 ├── frontend/app.py          # Streamlit 前端
-├── tests/                   # 73 个 unittest 用例（含 8 个 Web 集成测试）
+├── tests/                   # 80 个 unittest 用例（含 8 个 Web 集成测试）
 ├── tools/
 │   ├── coverage_report.py   # 自建覆盖率工具（compile + settrace，无需 coverage 包）
 │   ├── bench.py             # 压测 / 故障注入（缓存命中、冷路径、Redis 挂、LLM 挂、重试 A/B）
@@ -213,7 +213,7 @@ docker compose up -d                     # 五服务一键起
 ## 七、验证：测试 / 覆盖率 / 压测
 
 ```bash
-python -m unittest discover -s tests -t .        # 73 个用例，约 7s
+python -m unittest discover -s tests -t .        # 80 个用例
 python tools/coverage_report.py --json cov.json  # 自建覆盖率工具
 python tools/bench.py --port 8011                # 压测 + 故障注入（需先起服务）
 python tools/e2e_live.py                         # 真模型端到端（会消耗 token）
@@ -223,9 +223,9 @@ python tools/e2e_live.py                         # 真模型端到端（会消�
 
 | 项目 | 结果 |
 | --- | --- |
-| 单元 + 集成测试 | **73 passed / 0 failed**，约 7s |
-| 覆盖率 | **88.6%**（928/1047 行；web.py 83.3%） |
-| 缓存命中压测（32 并发 / 512 请求） | **0 错误**，73.2 req/s，P50 154ms / **P95 312ms** / P99 340ms |
+| 单元 + 集成测试 | **80 passed / 0 failed** |
+| 覆盖率 | **74.8%**（1480/1979 行；web.py 67.5%） |
+| 缓存命中压测（32 并发 / 512 请求） | **0 错误**，77.0 req/s，P50 149ms / **P95 268ms** / P99 331ms |
 | Redis 全挂 | 仍 **200**，`cache_source="local"`，248ms |
 | LLM 全挂 | 仍 **200**，2326 字降级报告，`degraded=true` |
 | 重试 A/B（260 次，40% 注入失败） | 成功率 **55.8% → 90.4%**（调用数 260 → 416） |
