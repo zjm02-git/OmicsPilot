@@ -3,6 +3,7 @@ name: omicspilot   # 项目名：compose 用它给容器/网络/卷加前缀。�
 services:
   mysql:
     image: mysql:8.0
+    restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: "123456"
       MYSQL_DATABASE: omics
@@ -18,6 +19,7 @@ services:
 
   redis:
     image: redis:latest
+    restart: unless-stopped
     ports:
       - "6379:6379"
 
@@ -26,6 +28,7 @@ services:
   # 所以业务数据放 MySQL，框架状态放这个 Postgres，分工明确。
   postgres:
     image: postgres:16                        # 官方 postgres 镜像（16 版，稳定）
+    restart: unless-stopped
     environment:                              # 容器第一次启动时，按这三个值自动建「用户 + 库」
       POSTGRES_USER: langgraph_user           #   用户名（必须和 config.py 的 DEFAULT_DB_URL 对上）
       POSTGRES_PASSWORD: "123456"             #   密码（同上）
@@ -41,6 +44,7 @@ services:
       retries: 20
   backend:
     build: .
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -67,6 +71,7 @@ services:
   # 演示容错：kill -9 掉一个 worker 容器，它 PEL 里没确认的任务会被存活的 worker 用 XAUTOCLAIM 接走。
   worker:
     build: .
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -87,6 +92,7 @@ services:
 
   frontend:
     build: ./frontend
+    restart: unless-stopped
     environment:
       BACKEND_URL: http://backend:8000
     ports:
