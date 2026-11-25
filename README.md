@@ -269,3 +269,5 @@ Python · LangGraph · LangChain · DeepSeek · bge-m3 · Chroma · FastAPI · S
 - [工程化升级说明](docs/工程化升级说明.md)：这次加固的每个决策、踩坑与复现命令
 - [简历项目条目](docs/简历项目条目.md)：可直接用的项目描述与面试口径
 - [项目总览](docs/项目总览.md) / [项目详解](docs/项目详解.md) / [面试知识点](docs/面试知识点.md)
+
+<!-- git 练习：2026-11-25 -->
