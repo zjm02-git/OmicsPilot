@@ -14,6 +14,18 @@ BASE=os.getenv("BACKEND_URL","http://127.0.0.1:8000")
 def get_header():
     token=st.session_state.get("token")
     return {"Authorization":f"Bearer {token}"} if  token else {}
+
+#=====工具一·补：从失败响应里取出能显示给人看的话=====
+#后端 422（阈值越界）/ 409（仍在等确认）/ 404（会话失效）都带 detail 字段，
+#直接 resp.json()["report"] 会 KeyError，用户看到的是红色异常栈而不是原因。
+def error_detail(resp):
+    try:
+        body=resp.json()
+    except ValueError:          # 不是 JSON（网关错误页之类）
+        return f"请求失败（HTTP {resp.status_code}）"
+    if isinstance(body,dict):
+        return body.get("detail") or body.get("message") or f"请求失败（HTTP {resp.status_code}）"
+    return f"请求失败（HTTP {resp.status_code}）"
 #把「掏 token + 拼请求头」这个重复动作抽出来，三处调接口都能用，
 
 #=====工具二：登录开关=====
@@ -137,6 +149,10 @@ else:
         st.session_state["thread_id"] = None
         st.session_state["qc_report"] = None
         st.session_state["done_report"] = None
+        # 阈值相关的三个键也一起清：上一份数据的阈值范围不该带到新任务上
+        st.session_state["current_thresholds"] = None
+        st.session_state["threshold_options"] = None
+        st.session_state["threshold_bounds"] = None
 
         # 它装的可能是「问答 / PCA / 聚类 / 质检失败」任何一份报告，不只是失败
 
@@ -151,6 +167,10 @@ else:
               if data["status"]=="pending_confirm":
                   st.session_state["thread_id"]=data["thread_id"]
                   st.session_state['qc_report']=data.get("qc_report")
+                  # 阈值相关：档位、当前值、允许范围都由后端给，前端不自己写死数字
+                  st.session_state["current_thresholds"]=data.get("current_thresholds") or {}
+                  st.session_state["threshold_options"]=data.get("threshold_options") or []
+                  st.session_state["threshold_bounds"]=data.get("threshold_bounds") or {}
               else:
                    st.session_state["done_report"]=data.get("report")
 
@@ -160,19 +180,111 @@ else:
         st.write("### 分析结果")
         st.write(st.session_state['done_report'])
 
-    # ========情况2：质检合格=========
+    # ========情况2：质检合格 → 人工确认（含显著性阈值）=========
     if st.session_state.get("qc_report"):
         st.write("### 质检报告")
         st.write(st.session_state['qc_report'])
-    if st.session_state.get("thread_id"):  # 有 thread_id（确实在等批准）才显示按钮
-        if st.button("✅ 批准继续"):
-            resp = requests.post(f"{BASE}/confirm", json={"thread_id": st.session_state["thread_id"], "approved": True},
-                                 headers=get_header())
-            st.write("### 最终报告")
-            st.write(resp.json()["report"])
-        if st.button("❌ 取消"):
-            resp = requests.post(f"{BASE}/confirm",
-                                 json={"thread_id": st.session_state["thread_id"], "approved": False},
-                                 headers=get_header())
-            st.write("### 分析已取消 ")
-            st.write(resp.json()["report"])
+    if st.session_state.get("thread_id"):  # 有 thread_id（确实在等批准）才显示
+        # ── 显著性阈值：三档预设 +「自定义」填真实研究常用值 ──
+        # 只给三档是不够的：FDR 0.02、|log2FC| 0.8 这种组合在文献里很常见，
+        # 三档装不下；又不能随便乱填，所以范围由后端给的 bounds 约束。
+        options = st.session_state.get("threshold_options") or []
+        bounds = st.session_state.get("threshold_bounds") or {}
+        current = st.session_state.get("current_thresholds") or {}
+
+        fc_bound = bounds.get("fc_threshold") or {}
+        fdr_bound = bounds.get("fdr_threshold") or {}
+        fc_min = float(fc_bound.get("min", 0.0))
+        fc_max = float(fc_bound.get("max", 5.0))
+        fc_step = float(fc_bound.get("step", 0.05))
+        fdr_min = float(fdr_bound.get("min", 0.001))
+        fdr_max = float(fdr_bound.get("max", 0.5))
+        fdr_step = float(fdr_bound.get("step", 0.005))
+
+        def clamp_value(value, low, high, fallback):
+            """把记忆里的旧值夹回合法区间：越界的初始值会让 number_input 直接报错。"""
+            try:
+                return min(max(float(value), low), high)
+            except (TypeError, ValueError):
+                return fallback
+
+        fc_current = clamp_value(current.get("fc_threshold"), fc_min, fc_max, 1.0)
+        fdr_current = clamp_value(current.get("fdr_threshold"), fdr_min, fdr_max, 0.05)
+
+        preset_names = [o.get("name", "档位") for o in options]
+        picked = st.radio(
+            "显著性阈值（决定哪些基因被判为差异基因）",
+            preset_names + ["自定义（填数值）"],
+            index=next((i for i, n in enumerate(preset_names) if "默认" in n), 0),
+            horizontal=True,
+        )
+
+        if picked == "自定义（填数值）":
+            col1, col2 = st.columns(2)
+            with col1:
+                fc_value = st.number_input(
+                    fc_bound.get("label", "|log2FC| 下限"),
+                    min_value=fc_min, max_value=fc_max, value=fc_current, step=fc_step,
+                    help=fc_bound.get("help", ""),
+                )
+            with col2:
+                fdr_value = st.number_input(
+                    fdr_bound.get("label", "FDR 上限"),
+                    min_value=fdr_min, max_value=fdr_max, value=fdr_current, step=fdr_step,
+                    help=fdr_bound.get("help", ""),
+                )
+            fc_rec = fc_bound.get("recommended") or []
+            fdr_rec = fdr_bound.get("recommended") or []
+            range_text = f"允许范围：|log2FC| {fc_min:g}–{fc_max:g}，FDR {fdr_min:g}–{fdr_max:g}"
+            if len(fc_rec) == 2 and len(fdr_rec) == 2:
+                range_text += (
+                    f"；文献常用：|log2FC| {fc_rec[0]:g}–{fc_rec[1]:g}"
+                    f"，FDR {fdr_rec[0]:g}–{fdr_rec[1]:g}"
+                )
+            st.caption(range_text)
+        else:
+            preset = options[preset_names.index(picked)] if preset_names else {}
+            fc_value = float(preset.get("fc_threshold", 1.0))
+            fdr_value = float(preset.get("fdr_threshold", 0.05))
+
+        st.caption(f"本次判定标准：|log2FC| > {fc_value:g} 且 FDR < {fdr_value:g}")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            approve = st.button("✅ 批准继续")
+        with col_b:
+            cancel = st.button("❌ 取消")
+
+        if approve:
+            resp = requests.post(
+                f"{BASE}/confirm",
+                json={
+                    "thread_id": st.session_state["thread_id"],
+                    "approved": True,
+                    # 显式带上用户选的阈值：不带就沿用记忆/默认值，
+                    # 那"记住偏好"永远学不到新东西
+                    "fc_threshold": float(fc_value),
+                    "fdr_threshold": float(fdr_value),
+                },
+                headers=get_header(),
+            )
+            if resp.status_code == 200:
+                st.session_state["done_report"] = resp.json().get("report")
+                st.session_state["thread_id"] = None
+                st.session_state["qc_report"] = None
+                st.rerun()  # 重新渲染，让报告走上面统一的展示分支
+            else:
+                st.error(error_detail(resp))
+        if cancel:
+            resp = requests.post(
+                f"{BASE}/confirm",
+                json={"thread_id": st.session_state["thread_id"], "approved": False},
+                headers=get_header(),
+            )
+            if resp.status_code == 200:
+                st.session_state["done_report"] = resp.json().get("report")
+                st.session_state["thread_id"] = None
+                st.session_state["qc_report"] = None
+                st.rerun()
+            else:
+                st.error(error_detail(resp))

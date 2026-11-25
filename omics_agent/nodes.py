@@ -23,7 +23,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
-from omics_agent import metrics
+from omics_agent import metrics, thresholds
 from omics_agent.config import get_model
 from omics_agent.context import drop_note, fit_blocks
 from omics_agent.dataio import read_csv_cached
@@ -265,14 +265,23 @@ def load_qc_node(state: dict, runtime: Runtime) -> dict:
 
     # 7. 读长期记忆：这个研究者上次做过分析，就复用他上次的阈值偏好
     user_id = state.get("user_id", "default")
-    fc_threshold, fdr_threshold = 1.0, 0.05
+    # 默认值只从 thresholds 取一次，别在别处再写一遍 1.0/0.05 —— 两处常量迟早漂移
+    fc_threshold, fdr_threshold = thresholds.FC_DEFAULT, thresholds.FDR_DEFAULT
     prefs_from_memory = False
     try:
         item = runtime.store.get((*MEMORY_NS, user_id), PREFS_KEY)
         if item and item.value:
-            fc_threshold = float(item.value.get("fc_threshold", 1.0))
-            fdr_threshold = float(item.value.get("fdr_threshold", 0.05))
-            prefs_from_memory = True
+            saved = thresholds.validate(
+                item.value.get("fc_threshold"), item.value.get("fdr_threshold")
+            )
+            # 记忆里的值可能来自旧版本（或被人手改过），越界就退回默认，
+            # 否则一条脏记忆会让这个用户之后所有分析都用离谱阈值，且没人知道为什么。
+            if saved.ok:
+                fc_threshold = float(item.value.get("fc_threshold", thresholds.FC_DEFAULT))
+                fdr_threshold = float(item.value.get("fdr_threshold", thresholds.FDR_DEFAULT))
+                prefs_from_memory = True
+            else:
+                metrics.incr("memory_prefs_invalid_total")
     except Exception:
         metrics.incr("memory_read_error_total")
         # 记忆读不到就用默认阈值，不影响主流程
@@ -314,10 +323,14 @@ def human_review_node(state: dict) -> dict:
         # 把当前阈值和可选档位一起抛给前端：用户必须有机会改，
         # 否则「长期记忆记住偏好」这件事从头到尾没有数据来源。
         "current_thresholds": {
-            "fc_threshold": state.get("fc_threshold", 1.0),
-            "fdr_threshold": state.get("fdr_threshold", 0.05),
+            "fc_threshold": state.get("fc_threshold", thresholds.FC_DEFAULT),
+            "fdr_threshold": state.get("fdr_threshold", thresholds.FDR_DEFAULT),
         },
         "threshold_options": THRESHOLD_PRESETS,
+        # 允许范围 + 建议区间：前端据此渲染"自定义输入框"的 min/max/step。
+        # 有 options 又能自己填，才是"可选择档位 + 可填研究常用值"；
+        # 只给三档的话，用户想用 FDR<0.02 这种真实存在的标准时无路可走。
+        "threshold_bounds": thresholds.bounds(),
     })
     if isinstance(decision, dict) and decision.get("approved") is False:
         # 用户主动取消 ≠ 质检没通过：用独立字段记下来，交给 report_node 分情况渲染。
@@ -328,11 +341,17 @@ def human_review_node(state: dict) -> dict:
         }
     out = {"review_decision": "approved"}
     if isinstance(decision, dict):
-        # 这一轮用户在确认时显式选的阈值（没传就沿用 state 里现有的值）
-        for key in ("fc_threshold", "fdr_threshold"):
-            val = decision.get(key)
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
-                out[key] = float(val)
+        # 这一轮用户在确认时显式选的阈值（没传就沿用 state 里现有的值）。
+        # 这里再校验一次而不是只信 HTTP 层：图也可能被直接调用（测试、脚本、
+        # 未来的异步 worker），越界的值一旦进 state 就会污染后续所有阶段。
+        check = thresholds.validate(decision.get("fc_threshold"), decision.get("fdr_threshold"))
+        if not check.ok:
+            metrics.incr("threshold_invalid_rejected_total")
+        else:
+            for key in ("fc_threshold", "fdr_threshold"):
+                val = decision.get(key)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    out[key] = float(val)
     return out
 
 

@@ -19,7 +19,8 @@ data/upload/
 .idea/
 .vscode/
 
-# Obsidian 笔记配置
+# Obsidian 笔记配置（工作区根目录与 docs/ 下都可能出现）
+.obsidian/
 docs/.obsidian/
 
 # 修复前的源码备份（只在本地保留，不入库）

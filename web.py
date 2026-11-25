@@ -66,6 +66,7 @@ from db import (
 from omics_agent import jobs as jobs_mod
 from omics_agent import metrics
 from omics_agent import ratelimit
+from omics_agent import thresholds
 from omics_agent.cache import ReportCache, build_key
 from omics_agent.graph import build_graph
 
@@ -842,6 +843,9 @@ def _run_graph(asg: AnalizeRequest, dataset_path: str, history_user_id: int, cac
             # 用户选的档位会经 /confirm 写回 state，并由 save_memory 落进长期记忆。
             "current_thresholds": info.get("current_thresholds"),
             "threshold_options": info.get("threshold_options"),
+            # 允许范围 + 建议区间：前端拿它渲染自定义输入框的 min/max/step，
+            # 与 /confirm 的校验共用 thresholds.py 一份常量（不会出现"页面能填、后端拒绝"）
+            "threshold_bounds": info.get("threshold_bounds"),
         }
 
     final_report = result.get("final_report") or ""
@@ -998,6 +1002,14 @@ def confirm(req: ConfirmRequest, user: dict = Depends(get_current_user)):
     if owner_id is None or str(owner_id) != str(user["user_id"]):
         metrics.incr("confirm_access_denied_total")
         raise HTTPException(status_code=404, detail="会话不存在或已失效")
+
+    # 阈值必须在进图之前校验：越界值一旦 resume 进 state，会一路带到差异分析、
+    # 富集、报告和长期记忆（save_memory 会把脏阈值记下来，影响这个用户之后所有任务）。
+    # 422 而不是 400：语义是"参数本身不合法"，前端可据此高亮输入框。
+    check = thresholds.validate(req.fc_threshold, req.fdr_threshold)
+    if not check.ok:
+        metrics.incr("threshold_invalid_rejected_total")
+        raise HTTPException(status_code=422, detail=check.message)
 
     config = {"configurable": {"thread_id": req.thread_id}}
     # 取图放在 try 之外：_require_graph 抛的 503 不能被下面的 except 吞成 400

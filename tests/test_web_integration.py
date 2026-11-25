@@ -393,6 +393,64 @@ class WebIntegrationTest(unittest.TestCase):
         finally:
             shutil.rmtree(bad_dir, ignore_errors=True)
 
+    # ── 9. 阈值可自定义 + 越界必须被后端拒绝 ────────────────
+    def test_09_threshold_bounds_and_validation(self) -> None:
+        """HITL 阈值从「只有三档」改成「档位 + 自定义数值」。
+
+        守三条：
+          1. /analyze 必须把 threshold_bounds 抛给前端，否则输入框没有 min/max，
+             前端只能退回硬编码默认值 —— 等于后端改了前端不知道；
+          2. 合法自定义值（文献常见的 |log2FC|>0.8、FDR<0.02）必须能通过；
+          3. 越界值必须 422，且**不消耗这次会话**：用户改对之后还能继续确认。
+             如果 422 把 interrupt 吃掉或把 state 弄脏，用户只能重跑一遍分析。
+        """
+        body, _key = self._analyze()
+        thread_id = body["thread_id"]
+
+        # 1. 前端渲染输入框所需的边界必须透出
+        bounds = body.get("threshold_bounds")
+        self.assertIsInstance(bounds, dict, body)
+        for key in ("fc_threshold", "fdr_threshold"):
+            self.assertIn(key, bounds)
+            self.assertLess(bounds[key]["min"], bounds[key]["max"])
+        self.assertIn("current_thresholds", body)
+        self.assertIn("threshold_options", body)
+
+        # 2a. 越界 |log2FC| → 422，且不进图（不会产生报告）
+        before = self._counter("threshold_invalid_rejected_total")
+        bad = self.client.post(
+            "/confirm",
+            json={"thread_id": thread_id, "approved": True, "fc_threshold": 9.0},
+            headers=self.headers,
+        )
+        self.assertEqual(bad.status_code, 422, bad.text)
+        self.assertIn("log2FC", bad.json()["detail"])
+        self.assertIn("5", bad.json()["detail"])  # 文案里必须带上允许范围
+        self.assertGreaterEqual(self._counter("threshold_invalid_rejected_total"), before + 1)
+
+        # 2b. 越界 FDR → 422
+        bad2 = self.client.post(
+            "/confirm",
+            json={"thread_id": thread_id, "approved": True, "fdr_threshold": 0.9},
+            headers=self.headers,
+        )
+        self.assertEqual(bad2.status_code, 422, bad2.text)
+        self.assertIn("FDR", bad2.json()["detail"])
+
+        # 3. 会话没被越界请求弄脏：改对之后仍能正常出报告
+        ok = self.client.post(
+            "/confirm",
+            json={
+                "thread_id": thread_id,
+                "approved": True,
+                "fc_threshold": 0.8,
+                "fdr_threshold": 0.02,
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(ok.status_code, 200, ok.text)
+        self.assertIn("# 多组学数据分析报告", ok.json()["report"])
+
 
 if __name__ == "__main__":
     unittest.main()
